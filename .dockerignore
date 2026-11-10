@@ -4,3 +4,5 @@
 __pycache__
 *.py[cod]
 data/*.db
+.pytest_cache
+tests

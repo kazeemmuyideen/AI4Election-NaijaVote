@@ -7,7 +7,10 @@ import hmac
 import json
 import math
 import os
+import re
 import sqlite3
+import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,10 +18,11 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "naijavote.db")))
@@ -30,6 +34,70 @@ SOURCES = {
     "NiMet": "https://nimet.gov.ng/weatherapi.php",
     "NIHSA": "https://nihsa.gov.ng/",
 }
+
+DECLINE_ANSWER = (
+    "I don’t have a verified answer for that question yet. "
+    "Please check INEC’s official voter education information or contact an INEC office."
+)
+
+ASK_RATE_LIMIT = int(os.getenv("ASK_RATE_LIMIT_PER_MINUTE", "60"))
+_RATE_LOCK = threading.Lock()
+_RATE_BUCKETS: dict[str, list[float]] = {}
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 date/datetime into an aware UTC datetime, or None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_active(expires_at: str | None) -> bool:
+    """A report is current when it has no expiry or a parseable future expiry."""
+    if not expires_at:
+        return True
+    parsed = _parse_datetime(expires_at)
+    return parsed is not None and parsed > datetime.now(timezone.utc)
+
+
+def _iso_datetime(value: str) -> str:
+    """Validate/normalize an ISO-8601 value to a UTC ISO string."""
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        raise ValueError("must be an ISO-8601 date or datetime")
+    return parsed.isoformat()
+
+
+def _https_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("must be an absolute HTTPS URL")
+    return value
+
+
+def _like(value: str) -> str:
+    """Escape LIKE wildcards so user input cannot match every row."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _check_rate_limit(request: Request) -> None:
+    if ASK_RATE_LIMIT <= 0:
+        return
+    now = time.monotonic()
+    key = request.client.host if request.client else "unknown"
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.setdefault(key, [])
+        bucket[:] = [stamp for stamp in bucket if stamp > now - 60]
+        if len(bucket) >= ASK_RATE_LIMIT:
+            raise HTTPException(429, "Too many questions. Please wait a minute and try again.")
+        bucket.append(now)
+
 
 FAQ: list[dict[str, Any]] = [
     {"id":"pvc", "keywords":["pvc","card","bring","document","vote"], "question":"What do I need to bring to vote?", "answer":"Bring your Permanent Voter’s Card (PVC). INEC’s official guidance should be checked for the election you plan to attend.", "source":"INEC", "source_url":SOURCES["INEC"], "language":"en"},
@@ -44,7 +112,7 @@ FAQ: list[dict[str, Any]] = [
 @contextmanager
 def db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
     try:
         yield con
@@ -57,6 +125,7 @@ def db():
 
 def init_db() -> None:
     with db() as con:
+        con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS polling_units (
           id TEXT PRIMARY KEY, state TEXT NOT NULL, lga TEXT NOT NULL, ward TEXT NOT NULL,
@@ -86,25 +155,81 @@ async def lifespan(_: FastAPI):
     init_db()
     yield
 
-app = FastAPI(title="NaijaVote Navigators API", version="1.0.0", description="Nonpartisan civic information, verified polling units, and source-backed climate risk data.", lifespan=lifespan)
+app = FastAPI(title="NaijaVote Navigators API", version="1.1.0", description="Nonpartisan civic information, verified polling units, and source-backed climate risk data.", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST"], allow_headers=["Content-Type","X-Twilio-Signature"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","X-Twilio-Signature"])
+
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+       "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
+       "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(self)")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
+        response.headers.setdefault("Content-Security-Policy", CSP)
+    return response
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=2, max_length=1000)
     language: str = Field(default="en", pattern="^(en|pcm|ha|ig|yo)$")
 
 class UnitUpload(BaseModel):
-    state: str; lga: str; ward: str; name: str; code: str
-    latitude: float | None = None; longitude: float | None = None
-    accessibility: str = "unknown"; source: str; source_url: str
+    state: str = Field(min_length=1, max_length=100)
+    lga: str = Field(min_length=1, max_length=100)
+    ward: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=300)
+    code: str = Field(min_length=1, max_length=100)
+    latitude: float | None = None
+    longitude: float | None = None
+    accessibility: str = "unknown"
+    source: str = Field(min_length=1, max_length=200)
+    source_url: str
     verified_at: str
 
+    @field_validator("source_url")
+    @classmethod
+    def _check_source_url(cls, value: str) -> str:
+        return _https_url(value)
+
+    @field_validator("verified_at")
+    @classmethod
+    def _check_verified_at(cls, value: str) -> str:
+        return _iso_datetime(value)
+
 class HazardUpload(BaseModel):
-    state: str; lga: str | None = None; ward: str | None = None
-    latitude: float | None = None; longitude: float | None = None
-    hazard: str; severity: int = Field(ge=0, le=100); details: str
-    source: str; source_url: str; observed_at: str; expires_at: str | None = None
+    state: str = Field(min_length=1, max_length=100)
+    lga: str | None = None
+    ward: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    hazard: str = Field(min_length=1, max_length=100)
+    severity: int = Field(ge=0, le=100)
+    details: str = Field(min_length=1, max_length=5000)
+    source: str = Field(min_length=1, max_length=200)
+    source_url: str
+    observed_at: str
+    expires_at: str | None = None
+
+    @field_validator("source_url")
+    @classmethod
+    def _check_source_url(cls, value: str) -> str:
+        return _https_url(value)
+
+    @field_validator("observed_at")
+    @classmethod
+    def _check_observed_at(cls, value: str) -> str:
+        return _iso_datetime(value)
+
+    @field_validator("expires_at")
+    @classmethod
+    def _check_expires_at(cls, value: str | None) -> str | None:
+        return _iso_datetime(value) if value else None
 
 class KnowledgeUpload(BaseModel):
     id: str = Field(min_length=2,max_length=100)
@@ -116,18 +241,41 @@ class KnowledgeUpload(BaseModel):
     source_url: str
     verified_at: str
 
-def _match(query: str, keywords: list[str]) -> int:
-    q = query.casefold()
-    return sum(3 if key in q else 0 for key in keywords)
+    @field_validator("source_url")
+    @classmethod
+    def _check_source_url(cls, value: str) -> str:
+        return _https_url(value)
 
-def _grounded_answer(query: str) -> dict[str, Any]:
+    @field_validator("verified_at")
+    @classmethod
+    def _check_verified_at(cls, value: str) -> str:
+        return _iso_datetime(value)
+
+def _match(query: str, keywords: list[str]) -> int:
+    """Score keyword hits on whole words/phrases, not substrings."""
+    q = query.casefold()
+    score = 0
+    for key in keywords:
+        key = str(key).casefold().strip()
+        if key and re.search(rf"(?<!\w){re.escape(key)}(?!\w)", q):
+            score += 3
+    return score
+
+def _grounded_answer(query: str, language: str = "en") -> dict[str, Any]:
     with db() as con:
         rows = con.execute("SELECT * FROM knowledge").fetchall()
-    ranked = sorted((( _match(query, json.loads(row['keywords'])), row) for row in rows), key=lambda x:x[0], reverse=True)
-    if not ranked or ranked[0][0] == 0:
-        return {"answer":"I don’t have a verified answer for that question yet. Please check INEC’s official voter education information or contact an INEC office.", "confidence":"low", "citations":[{"title":"INEC voter education","url":SOURCES['INEC']}], "language":"en"}
-    score,row = ranked[0]
-    return {"answer":row['answer'], "confidence":"high" if score >= 3 else "medium", "citations":[{"title":row['source'],"url":row['source_url'],"verified_at":row['verified_at']}], "language":row['language']}
+
+    def best(candidates: list[sqlite3.Row]) -> tuple[int, sqlite3.Row] | None:
+        ranked = sorted(((_match(query, json.loads(row['keywords'])), row) for row in candidates), key=lambda x: x[0], reverse=True)
+        return ranked[0] if ranked and ranked[0][0] > 0 else None
+
+    match = best([row for row in rows if row['language'] == language])
+    if match is None and language != "en":
+        match = best([row for row in rows if row['language'] == "en"])
+    if match is None:
+        return {"answer": DECLINE_ANSWER, "confidence": "low", "citations": [{"title": "INEC voter education", "url": SOURCES['INEC']}], "language": "en"}
+    score, row = match
+    return {"answer": row['answer'], "confidence": "high" if score >= 6 else "medium", "citations": [{"title": row['source'], "url": row['source_url'], "verified_at": row['verified_at']}], "language": row['language']}
 
 @app.get("/api/health")
 def health():
@@ -137,11 +285,12 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"languages":[{"code":"en","name":"English"},{"code":"pcm","name":"Nigerian Pidgin"},{"code":"ha","name":"Hausa"},{"code":"ig","name":"Igbo"},{"code":"yo","name":"Yorùbá"}],"official_locator":INEC_URL,"features":{"voice_input":True,"voice_output":True,"live_weather":bool(os.getenv('NIMET_API_KEY')),"polling_unit_lookup":True}}
+    return {"languages":[{"code":"en","name":"English"},{"code":"pcm","name":"Nigerian Pidgin"},{"code":"ha","name":"Hausa"},{"code":"ig","name":"Igbo"},{"code":"yo","name":"Yorùbá"}],"official_locator":INEC_URL,"features":{"voice_input":True,"voice_output":True,"live_weather":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"polling_unit_lookup":True}}
 
 @app.post("/api/ask")
-async def ask(payload: AskRequest):
-    result=_grounded_answer(payload.question)
+async def ask(payload: AskRequest, request: Request):
+    _check_rate_limit(request)
+    result = await run_in_threadpool(_grounded_answer, payload.question, payload.language)
     if payload.language != "en" and result.get("language") != payload.language:
         key=os.getenv("LLM_API_KEY"); endpoint=os.getenv("LLM_BASE_URL","https://api.openai.com/v1/chat/completions"); model=os.getenv("LLM_MODEL","gpt-4o-mini")
         if key:
@@ -164,21 +313,20 @@ async def ask(payload: AskRequest):
 
 @app.get("/api/polling-units")
 def polling_units(state: str, lga: str = "", ward: str = "", q: str = "", limit: int = Query(default=20, ge=1, le=100)):
-    clauses=["state LIKE ?"]; args=[f"%{state}%"]
-    if lga: clauses.append("(lga LIKE ? OR ward LIKE ?)"); args.extend([f"%{lga}%",f"%{lga}%"])
-    if ward: clauses.append("ward LIKE ?"); args.append(f"%{ward}%")
-    if q: clauses.append("(name LIKE ? OR code LIKE ?)"); args.extend([f"%{q}%",f"%{q}%"])
+    clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
+    if lga: clauses.append("(lga LIKE ? ESCAPE '\\' OR ward LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(lga)}%",f"%{_like(lga)}%"])
+    if ward: clauses.append("ward LIKE ? ESCAPE '\\'"); args.append(f"%{_like(ward)}%")
+    if q: clauses.append("(name LIKE ? ESCAPE '\\' OR code LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(q)}%",f"%{_like(q)}%"])
     with db() as con: rows=con.execute(f"SELECT * FROM polling_units WHERE {' AND '.join(clauses)} ORDER BY lga,ward,name LIMIT ?",(*args,limit)).fetchall()
     return {"results":[dict(r) for r in rows],"count":len(rows),"source":"source-attributed local register","official_locator":INEC_URL,"notice":None if rows else "No verified polling units were found in the local data. Use INEC’s official locator for your assigned unit."}
 
 @app.get("/api/risk")
 def risk(state: str, lga: str = "", ward: str = ""):
-    clauses=["state LIKE ?"]; args=[f"%{state}%"]
+    clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
     for col,val in (("lga",lga),("ward",ward)):
-        if val: clauses.append(f"({col} IS NULL OR {col} LIKE ?)"); args.append(f"%{val}%")
-    now=datetime.now(timezone.utc).isoformat()
-    with db() as con: rows=con.execute(f"SELECT * FROM hazard_reports WHERE {' AND '.join(clauses)} AND (expires_at IS NULL OR expires_at > ?)",(*args,now)).fetchall()
-    alerts=[dict(r) for r in rows]
+        if val: clauses.append(f"({col} IS NULL OR {col} LIKE ? ESCAPE '\\')"); args.append(f"%{_like(val)}%")
+    with db() as con: rows=con.execute(f"SELECT * FROM hazard_reports WHERE {' AND '.join(clauses)}",(*args,)).fetchall()
+    alerts=[dict(r) for r in rows if _is_active(r['expires_at'])]
     score=max((r['severity'] for r in alerts),default=None)
     return {"state":state,"risk_score":score,"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","alerts":alerts,"source_status":"connected" if alerts else "no verified local alerts","note":"Risk scores reflect only current imported official alerts; no alert does not mean no hazard.","sources":[{"title":"NiMet weather API","url":SOURCES['NiMet']},{"title":"NIHSA flood information","url":SOURCES['NIHSA']}]}
 
@@ -191,16 +339,17 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 @app.get("/api/polling-units/{unit_id}/risk")
 def unit_risk(unit_id: str):
-    now=datetime.now(timezone.utc).isoformat()
     with db() as con:
         unit=con.execute("SELECT * FROM polling_units WHERE id=?",(unit_id,)).fetchone()
         if not unit: raise HTTPException(404,"Polling unit not found in verified local data")
         if unit['latitude'] is None or unit['longitude'] is None:
             return {"polling_unit":unit['name'],"risk_level":"unknown","risk_score":None,"alerts":[],"note":"This polling unit has no verified coordinates in the local register."}
-        hazards=con.execute("SELECT * FROM hazard_reports WHERE state LIKE ? AND latitude IS NOT NULL AND longitude IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)",(f"%{unit['state']}%",now)).fetchall()
+        hazards=con.execute("SELECT * FROM hazard_reports WHERE state LIKE ? ESCAPE '\\' AND latitude IS NOT NULL AND longitude IS NOT NULL",(f"%{_like(unit['state'])}%",)).fetchall()
     radius=float(os.getenv("RISK_PROXIMITY_KM","10"))
     nearby=[]
     for hazard in hazards:
+        if not _is_active(hazard['expires_at']):
+            continue
         km=distance_km(unit['latitude'],unit['longitude'],hazard['latitude'],hazard['longitude'])
         if km<=radius:
             alert=dict(hazard); alert['distance_km']=round(km,1); nearby.append(alert)
@@ -220,55 +369,61 @@ async def weather(state: str):
     except (httpx.HTTPError,ValueError) as exc:
         return JSONResponse(status_code=502,content={"available":False,"message":"NiMet could not provide an update right now.","source":SOURCES['NiMet']})
 
-def _require_admin(request: Request):
+def require_admin(authorization: str = Header(default="")) -> None:
     token=os.getenv("ADMIN_API_TOKEN")
     if not token or token=="replace-with-a-long-random-secret": raise HTTPException(503,"Set a unique ADMIN_API_TOKEN before using admin routes")
-    if not hmac.compare_digest(request.headers.get("authorization", "").removeprefix("Bearer "),token):
+    supplied=authorization[7:] if authorization.startswith("Bearer ") else authorization
+    if not hmac.compare_digest(supplied,token):
         raise HTTPException(401,"Valid admin bearer token required")
 
-@app.post("/api/admin/polling-units")
-def add_unit(payload: UnitUpload, request: Request):
-    _require_admin(request)
-    if not payload.source_url.startswith("https://"): raise HTTPException(400,"source_url must be HTTPS")
-    identity=f"{payload.state}|{payload.lga}|{payload.ward}|{payload.code}"
+def _unit_row(p: UnitUpload) -> tuple:
+    identity=f"{p.state}|{p.lga}|{p.ward}|{p.code}"
     uid=hashlib.sha256(identity.casefold().encode()).hexdigest()[:24]
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(uid,payload.state,payload.lga,payload.ward,payload.name,payload.code,payload.latitude,payload.longitude,payload.accessibility,payload.source,payload.source_url,payload.verified_at))
-    return {"id":uid,"status":"saved"}
+    return (uid,p.state,p.lga,p.ward,p.name,p.code,p.latitude,p.longitude,p.accessibility,p.source,p.source_url,p.verified_at)
 
-@app.post("/api/admin/hazards")
-def add_hazard(payload: HazardUpload, request: Request):
-    _require_admin(request)
-    if not payload.source_url.startswith("https://"): raise HTTPException(400,"source_url must be HTTPS")
-    identity=f"{payload.state}|{payload.lga}|{payload.ward}|{payload.hazard}|{payload.observed_at}"
+def _hazard_row(report: HazardUpload) -> tuple:
+    identity=f"{report.state}|{report.lga}|{report.ward}|{report.hazard}|{report.observed_at}"
     uid=hashlib.sha256(identity.casefold().encode()).hexdigest()[:24]
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid,payload.state,payload.lga,payload.ward,payload.latitude,payload.longitude,payload.hazard,payload.severity,payload.details,payload.source,payload.source_url,payload.observed_at,payload.expires_at))
-    return {"id":uid,"status":"saved"}
+    return (uid,report.state,report.lga,report.ward,report.latitude,report.longitude,report.hazard,report.severity,report.details,report.source,report.source_url,report.observed_at,report.expires_at)
 
-@app.post("/api/admin/import-polling-units")
+@app.post("/api/admin/polling-units", dependencies=[Depends(require_admin)])
+def add_unit(payload: UnitUpload):
+    row=_unit_row(payload)
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",row)
+    return {"id":row[0],"status":"saved"}
+
+@app.post("/api/admin/hazards", dependencies=[Depends(require_admin)])
+def add_hazard(payload: HazardUpload):
+    row=_hazard_row(payload)
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",row)
+    return {"id":row[0],"status":"saved"}
+
+@app.post("/api/admin/import-polling-units", dependencies=[Depends(require_admin)])
 async def import_units(request: Request):
-    _require_admin(request)
     body=await request.body()
     if len(body)>20_000_000: raise HTTPException(413,"CSV exceeds 20 MB")
-    try:
-        reader=csv.DictReader(body.decode("utf-8-sig").splitlines())
-        needed={"state","lga","ward","name","code","source","source_url","verified_at"}
-        if not needed.issubset(set(reader.fieldnames or [])): raise ValueError(f"Required CSV columns: {', '.join(sorted(needed))}")
-        items=[]
-        for row in reader:
-            for key in ("latitude","longitude","accessibility"):
-                if row.get(key)=="": row[key]=None if key!="accessibility" else "unknown"
-            p=UnitUpload(**row); identity=f"{p.state}|{p.lga}|{p.ward}|{p.code}"; uid=hashlib.sha256(identity.casefold().encode()).hexdigest()[:24]
-            items.append((uid,p.state,p.lga,p.ward,p.name,p.code,p.latitude,p.longitude,p.accessibility,p.source,p.source_url,p.verified_at))
-    except (UnicodeDecodeError,ValueError,TypeError) as exc: raise HTTPException(400,str(exc)) from exc
-    with db() as con: con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",items)
-    return {"imported":len(items)}
 
-@app.post("/api/admin/knowledge")
-def add_knowledge(payload: KnowledgeUpload, request: Request):
-    _require_admin(request)
-    if not payload.source_url.startswith("https://"): raise HTTPException(400,"source_url must be HTTPS")
+    def _import() -> int:
+        try:
+            reader=csv.DictReader(body.decode("utf-8-sig").splitlines())
+            needed={"state","lga","ward","name","code","source","source_url","verified_at"}
+            if not needed.issubset(set(reader.fieldnames or [])): raise ValueError(f"Required CSV columns: {', '.join(sorted(needed))}")
+            items=[]
+            for row in reader:
+                for key in ("latitude","longitude","accessibility"):
+                    if row.get(key)=="": row[key]=None if key!="accessibility" else "unknown"
+                items.append(_unit_row(UnitUpload(**row)))
+        except (UnicodeDecodeError,ValueError,TypeError) as exc:
+            raise HTTPException(400,str(exc)) from exc
+        with db() as con: con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",items)
+        return len(items)
+
+    return {"imported": await run_in_threadpool(_import)}
+
+@app.post("/api/admin/knowledge", dependencies=[Depends(require_admin)])
+def add_knowledge(payload: KnowledgeUpload):
     with db() as con:
         con.execute("INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?,?,?,?,?)",(payload.id,payload.question,payload.answer,payload.language,json.dumps([x.casefold() for x in payload.keywords]),payload.source,payload.source_url,payload.verified_at))
     return {"id":payload.id,"status":"saved"}
@@ -283,38 +438,40 @@ async def whatsapp(request: Request):
     signed+= ''.join(key+str(form.get(key,"")) for key in sorted(form.keys()))
     expected=__import__('base64').b64encode(hmac.new(token.encode(),signed.encode(),hashlib.sha1).digest()).decode()
     if not hmac.compare_digest(signature,expected): raise HTTPException(403,"Invalid provider signature")
-    incoming=str(form.get("Body", "")).strip(); sender=str(form.get("From", ""))
+    incoming=str(form.get("Body", "")).strip()
     if not incoming: return Response(content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Please send a civic question. For official information, visit inecnigeria.org.</Message></Response>",media_type="application/xml")
-    result=_grounded_answer(incoming)
+    result=await run_in_threadpool(_grounded_answer, incoming, "en")
     reply=f"{result['answer']} Source: {result['citations'][0]['url']}"
+    if len(reply)>1500: reply=reply[:1490]+"…"
     xml=f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{reply.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')}</Message></Response>"
     return Response(content=xml,media_type="application/xml")
 
-@app.post("/api/admin/sync-nihsa")
-async def sync_nihsa(request: Request):
-    _require_admin(request)
+@app.post("/api/admin/sync-nihsa", dependencies=[Depends(require_admin)])
+async def sync_nihsa():
     feed=os.getenv("NIHSA_FEED_URL")
     if not feed: raise HTTPException(503,"Configure an authorized NIHSA_FEED_URL first")
+    if not feed.startswith("https://"): raise HTTPException(500,"NIHSA_FEED_URL must use HTTPS")
     headers={}
     if os.getenv("NIHSA_API_TOKEN"): headers["Authorization"]=f"Bearer {os.getenv('NIHSA_API_TOKEN')}"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response=await client.get(feed,headers=headers); response.raise_for_status(); data=response.json()
         if not isinstance(data,list): raise ValueError("Expected a JSON array of normalized hazard reports")
-        imported=0
+        items=[]
         for raw in data:
             report=HazardUpload(**raw)
             hostname=urlparse(report.source_url).hostname or ""
             if not (hostname=="nihsa.gov.ng" or hostname.endswith(".nihsa.gov.ng")):
                 raise ValueError("Each report must cite an official NIHSA source URL")
-            identity=f"{report.state}|{report.lga}|{report.ward}|{report.hazard}|{report.observed_at}"
-            uid=hashlib.sha256(identity.casefold().encode()).hexdigest()[:24]
-            with db() as con: con.execute("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(uid,report.state,report.lga,report.ward,report.latitude,report.longitude,report.hazard,report.severity,report.details,report.source,report.source_url,report.observed_at,report.expires_at))
-            imported+=1
-        return {"imported":imported,"source":"NIHSA authorized feed"}
+            items.append(_hazard_row(report))
+        def _save() -> None:
+            with db() as con: con.executemany("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",items)
+        await run_in_threadpool(_save)
+        return {"imported":len(items),"source":"NIHSA authorized feed"}
     except (httpx.HTTPError,ValueError,TypeError) as exc: raise HTTPException(502,f"NIHSA feed could not be normalized: {exc}") from exc
 
 @app.get("/", include_in_schema=False)
+@app.get("/index.html", include_in_schema=False)
 def frontend(): return FileResponse(ROOT / "index.html")
 
 @app.get("/styles.css", include_in_schema=False)
@@ -331,4 +488,10 @@ def manifest(): return FileResponse(ROOT / "manifest.webmanifest", media_type="a
 
 @app.get("/favicon.svg", include_in_schema=False)
 def icon(): return FileResponse(ROOT / "favicon.svg", media_type="image/svg+xml")
+
+@app.get("/icon-192.png", include_in_schema=False)
+def icon_192(): return FileResponse(ROOT / "icon-192.png", media_type="image/png")
+
+@app.get("/icon-512.png", include_in_schema=False)
+def icon_512(): return FileResponse(ROOT / "icon-512.png", media_type="image/png")
 

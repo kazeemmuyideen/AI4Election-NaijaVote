@@ -15,14 +15,21 @@ cp .env.example .env
 uvicorn backend.app:app --reload --env-file .env
 ```
 
+Run the test suite with the development dependencies:
+
+```sh
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
 Open `http://localhost:8000`. API documentation is at `/docs`; health and data-source status are at `/api/health`. SQLite is created automatically under `data/` by default. Set `DATABASE_PATH` to move it to a persistent volume.
 
 For a container run, use the included `Dockerfile` and `docker-compose.yml` or pass environment variables through your deployment secret manager, and mount a persistent volume at `/app/data`. Do not expose `/docs` or admin endpoints without the production access controls provided by your gateway.
 
 ## Current behavior and source guarantees
 
-- Civic answers use a small, curated retrieval set. The API returns its official citation and declines unrelated questions. This is not a comprehensive, continuously synchronized INEC knowledge base.
-- English source answers can optionally be translated by an OpenAI-compatible chat-completions endpoint when `LLM_API_KEY` is configured. Translation is constrained to the retrieved answer; the original source citation is retained. Without a translation provider, the UI explicitly displays English rather than inventing legal/electoral translations.
+- Civic answers use a small, curated retrieval set. Keyword matching is whole-word/phrase based, answers stored in the requested language are preferred, and the API declines questions with no verified match. This is not a comprehensive, continuously synchronized INEC knowledge base.
+- English source answers can optionally be translated by an OpenAI-compatible chat-completions endpoint when `LLM_API_KEY` is configured. Translation is constrained to the retrieved answer; the original source citation is retained. Without a translation provider, the UI explicitly displays English rather than inventing legal/electoral translations. A question in a language with no matching local answer still falls back to English retrieval before declining.
 - Polling units are returned only from the local, source-attributed register. No fictitious locations are seeded. If a search has no data, the UI links to INEC's [official polling-unit locator](https://cvr.inecnigeria.org/pu).
 - Risk scores come only from current imported hazard reports. “Unknown” means there is no verified report in the local store; it does not mean safe. Imported scores are not a route-safety guarantee.
 - Polling-unit proximity checks require coordinates on both the unit and alert, and use the configurable `RISK_PROXIMITY_KM` radius (10 km by default). This is a proximity alert, not floodplain intersection or a dry-route calculation.
@@ -41,11 +48,11 @@ curl -X POST http://localhost:8000/api/admin/import-polling-units \
   --data-binary @data/polling_units.example.csv
 ```
 
-Required CSV headers: `state,lga,ward,name,code,source,source_url,verified_at`. Optional headers: `latitude,longitude,accessibility`. Use HTTPS official source links. Never add voters' names, VINs, phone numbers, or other personal registration data.
+Required CSV headers: `state,lga,ward,name,code,source,source_url,verified_at`. Optional headers: `latitude,longitude,accessibility`. Use HTTPS official source links. The importer rejects empty required fields, non-HTTPS `source_url` values, and `verified_at` values that are not ISO-8601. Never add voters' names, VINs, phone numbers, or other personal registration data.
 
 ## Hazard data
 
-Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`; optional fields are `lga`, `ward`, `latitude`, `longitude`, `expires_at`. Source links must use HTTPS. Expired reports are excluded from lookups.
+Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`; optional fields are `lga`, `ward`, `latitude`, `longitude`, `expires_at`. Source links must use HTTPS. `observed_at` and `expires_at` must be ISO-8601; values without a timezone are treated as UTC, and a date-only `expires_at` expires at 00:00 UTC (prefer a full datetime). Expired reports are excluded from lookups.
 
 An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihsa`. It must be a trusted HTTPS URL whose JSON response is an array of those normalized alert objects, each citing an official `nihsa.gov.ng` URL. Store feed credentials in `NIHSA_API_TOKEN`, not in source control. Run scheduled synchronization from a protected scheduler and monitor failures.
 
@@ -69,7 +76,7 @@ An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihs
 
 ## Environment settings
 
-See [.env.example](.env.example). Required for data administration: `ADMIN_API_TOKEN`. Optional integrations: `NIMET_API_KEY` + `NIMET_ENDPOINT`, `NIHSA_FEED_URL` + `NIHSA_API_TOKEN`, and `LLM_API_KEY` with optional `LLM_BASE_URL` and `LLM_MODEL`. Twilio inbound webhooks require `TWILIO_AUTH_TOKEN`; set `TWILIO_WEBHOOK_URL` to the exact public HTTPS callback URL when running behind a proxy, register it with Twilio, and enable WhatsApp in your account. Do not commit `.env` or provider credentials.
+See [.env.example](.env.example). Required for data administration: `ADMIN_API_TOKEN`. Optional integrations: `NIMET_API_KEY` + `NIMET_ENDPOINT`, `NIHSA_FEED_URL` + `NIHSA_API_TOKEN`, and `LLM_API_KEY` with optional `LLM_BASE_URL` and `LLM_MODEL`. `ASK_RATE_LIMIT_PER_MINUTE` caps `/api/ask` per client (default 60; set to 0 to disable). Twilio inbound webhooks require `TWILIO_AUTH_TOKEN`; set `TWILIO_WEBHOOK_URL` to the exact public HTTPS callback URL when running behind a proxy, register it with Twilio, and enable WhatsApp in your account. Do not commit `.env` or provider credentials.
 
 ## Production completion checklist
 
