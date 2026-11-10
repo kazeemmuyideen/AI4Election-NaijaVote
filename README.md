@@ -30,6 +30,7 @@ For a container run, use the included `Dockerfile` and `docker-compose.yml` or p
 
 - Civic answers use a small, curated retrieval set. Keyword matching is whole-word/phrase based, answers stored in the requested language are preferred, and the API declines questions with no verified match. This is not a comprehensive, continuously synchronized INEC knowledge base.
 - English source answers can optionally be translated by an OpenAI-compatible chat-completions endpoint when `LLM_API_KEY` is configured. Translation is constrained to the retrieved answer; the original source citation is retained. Without a translation provider, the UI explicitly displays English rather than inventing legal/electoral translations. A question in a language with no matching local answer still falls back to English retrieval before declining.
+- The language selector currently translates only selected navigation and chat prompts; most page content remains English. Review translations with native civic and legal reviewers before relying on them for public election services.
 - Polling units are returned only from the local, source-attributed register. No fictitious locations are seeded. If a search has no data, the UI links to INEC's [official polling-unit locator](https://cvr.inecnigeria.org/pu).
 - Risk scores come only from current imported hazard reports. “Unknown” means there is no verified report in the local store; it does not mean safe. Imported scores are not a route-safety guarantee.
 - Polling-unit proximity checks require coordinates on both the unit and alert, and use the configurable `RISK_PROXIMITY_KM` radius (10 km by default). This is a proximity alert, not floodplain intersection or a dry-route calculation.
@@ -52,9 +53,9 @@ Required CSV headers: `state,lga,ward,name,code,source,source_url,verified_at`. 
 
 ## Hazard data
 
-Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`; optional fields are `lga`, `ward`, `latitude`, `longitude`, `expires_at`. Source links must use HTTPS. `observed_at` and `expires_at` must be ISO-8601; values without a timezone are treated as UTC, and a date-only `expires_at` expires at 00:00 UTC (prefer a full datetime). Expired reports are excluded from lookups.
+Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`, and `expires_at`; optional fields are `lga`, `ward`, `latitude`, and `longitude`. Source links must use HTTPS. `observed_at` and `expires_at` must be ISO-8601; values without a timezone are treated as UTC, and a date-only `expires_at` expires at 00:00 UTC (prefer a full datetime). Expired reports and legacy reports without an expiry are excluded from lookups.
 
-An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihsa`. It must be a trusted HTTPS URL whose JSON response is an array of those normalized alert objects, each citing an official `nihsa.gov.ng` URL. Store feed credentials in `NIHSA_API_TOKEN`, not in source control. Run scheduled synchronization from a protected scheduler and monitor failures.
+An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihsa`. It must be a trusted HTTPS URL whose JSON response is an array of those normalized alert objects, each citing an official `nihsa.gov.ng` URL. Reports with future observation times or expired timestamps, and legacy reports without an expiry, are excluded from risk lookups. Store feed credentials in `NIHSA_API_TOKEN`, not in source control. Run scheduled synchronization from a protected scheduler and monitor failures.
 
 ## API
 

@@ -21,7 +21,7 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,19 +51,24 @@ def _parse_datetime(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
-def _is_active(expires_at: str | None) -> bool:
-    """A report is current when it has no expiry or a parseable future expiry."""
+def _is_active(expires_at: str | None, observed_at: str | None = None) -> bool:
+    """A report is current when its timestamps are valid and it is not expired or future-dated."""
+    now = datetime.now(timezone.utc)
+    if observed_at:
+        observed = _parse_datetime(observed_at)
+        if observed is None or observed > now:
+            return False
     if not expires_at:
-        return True
+        return False
     parsed = _parse_datetime(expires_at)
-    return parsed is not None and parsed > datetime.now(timezone.utc)
+    return parsed is not None and parsed > now
 
 
 def _iso_datetime(value: str) -> str:
@@ -75,8 +80,12 @@ def _iso_datetime(value: str) -> str:
 
 
 def _https_url(value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or not parsed.netloc:
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+    except ValueError:
+        raise ValueError("must be an absolute HTTPS URL") from None
+    if parsed.scheme != "https" or not hostname or parsed.username or parsed.password:
         raise ValueError("must be an absolute HTTPS URL")
     return value
 
@@ -176,21 +185,29 @@ async def security_headers(request: Request, call_next):
     return response
 
 class AskRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     question: str = Field(min_length=2, max_length=1000)
     language: str = Field(default="en", pattern="^(en|pcm|ha|ig|yo)$")
 
 class UnitUpload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     state: str = Field(min_length=1, max_length=100)
     lga: str = Field(min_length=1, max_length=100)
     ward: str = Field(min_length=1, max_length=100)
     name: str = Field(min_length=1, max_length=300)
     code: str = Field(min_length=1, max_length=100)
-    latitude: float | None = None
-    longitude: float | None = None
+    latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
     accessibility: str = "unknown"
     source: str = Field(min_length=1, max_length=200)
     source_url: str
     verified_at: str
+
+    @model_validator(mode="after")
+    def _coordinates_are_paired(self) -> "UnitUpload":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        return self
 
     @field_validator("source_url")
     @classmethod
@@ -203,18 +220,30 @@ class UnitUpload(BaseModel):
         return _iso_datetime(value)
 
 class HazardUpload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     state: str = Field(min_length=1, max_length=100)
     lga: str | None = None
     ward: str | None = None
-    latitude: float | None = None
-    longitude: float | None = None
+    latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
     hazard: str = Field(min_length=1, max_length=100)
     severity: int = Field(ge=0, le=100)
     details: str = Field(min_length=1, max_length=5000)
     source: str = Field(min_length=1, max_length=200)
     source_url: str
     observed_at: str
-    expires_at: str | None = None
+    expires_at: str
+
+    @model_validator(mode="after")
+    def _validate_coordinates_and_expiry(self) -> "HazardUpload":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        if self.expires_at:
+            observed = _parse_datetime(self.observed_at)
+            expires = _parse_datetime(self.expires_at)
+            if observed is not None and expires is not None and expires <= observed:
+                raise ValueError("expires_at must be later than observed_at")
+        return self
 
     @field_validator("source_url")
     @classmethod
@@ -228,10 +257,11 @@ class HazardUpload(BaseModel):
 
     @field_validator("expires_at")
     @classmethod
-    def _check_expires_at(cls, value: str | None) -> str | None:
-        return _iso_datetime(value) if value else None
+    def _check_expires_at(cls, value: str) -> str:
+        return _iso_datetime(value)
 
 class KnowledgeUpload(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
     id: str = Field(min_length=2,max_length=100)
     question: str = Field(min_length=5,max_length=1000)
     answer: str = Field(min_length=5,max_length=5000)
@@ -240,6 +270,14 @@ class KnowledgeUpload(BaseModel):
     source: str = Field(min_length=2,max_length=200)
     source_url: str
     verified_at: str
+
+    @field_validator("keywords")
+    @classmethod
+    def _check_keywords(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("keywords must not be empty")
+        return cleaned
 
     @field_validator("source_url")
     @classmethod
@@ -303,7 +341,7 @@ async def ask(payload: AskRequest, request: Request):
                 translated=response.json()["choices"][0]["message"]["content"].strip()
                 if translated: result['answer']=translated; result['language']=payload.language
                 else: raise ValueError("empty translation")
-            except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError):
+            except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError,AttributeError):
                 result['requested_language']=payload.language
                 result['notice']='A translated answer is temporarily unavailable. English source text is shown to avoid inventing civic guidance.'
         else:
@@ -312,7 +350,9 @@ async def ask(payload: AskRequest, request: Request):
     return result
 
 @app.get("/api/polling-units")
-def polling_units(state: str, lga: str = "", ward: str = "", q: str = "", limit: int = Query(default=20, ge=1, le=100)):
+def polling_units(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = "", q: str = "", limit: int = Query(default=20, ge=1, le=100)):
+    state=state.strip()
+    if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
     if lga: clauses.append("(lga LIKE ? ESCAPE '\\' OR ward LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(lga)}%",f"%{_like(lga)}%"])
     if ward: clauses.append("ward LIKE ? ESCAPE '\\'"); args.append(f"%{_like(ward)}%")
@@ -321,12 +361,14 @@ def polling_units(state: str, lga: str = "", ward: str = "", q: str = "", limit:
     return {"results":[dict(r) for r in rows],"count":len(rows),"source":"source-attributed local register","official_locator":INEC_URL,"notice":None if rows else "No verified polling units were found in the local data. Use INEC’s official locator for your assigned unit."}
 
 @app.get("/api/risk")
-def risk(state: str, lga: str = "", ward: str = ""):
+def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = ""):
+    state=state.strip()
+    if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
     for col,val in (("lga",lga),("ward",ward)):
         if val: clauses.append(f"({col} IS NULL OR {col} LIKE ? ESCAPE '\\')"); args.append(f"%{_like(val)}%")
     with db() as con: rows=con.execute(f"SELECT * FROM hazard_reports WHERE {' AND '.join(clauses)}",(*args,)).fetchall()
-    alerts=[dict(r) for r in rows if _is_active(r['expires_at'])]
+    alerts=[dict(r) for r in rows if _is_active(r['expires_at'], r['observed_at'])]
     score=max((r['severity'] for r in alerts),default=None)
     return {"state":state,"risk_score":score,"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","alerts":alerts,"source_status":"connected" if alerts else "no verified local alerts","note":"Risk scores reflect only current imported official alerts; no alert does not mean no hazard.","sources":[{"title":"NiMet weather API","url":SOURCES['NiMet']},{"title":"NIHSA flood information","url":SOURCES['NIHSA']}]}
 
@@ -335,6 +377,7 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     p1,p2=math.radians(lat1),math.radians(lat2)
     dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
     a=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    a=min(1.0,max(0.0,a))
     return radius*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
 
 @app.get("/api/polling-units/{unit_id}/risk")
@@ -348,7 +391,7 @@ def unit_risk(unit_id: str):
     radius=float(os.getenv("RISK_PROXIMITY_KM","10"))
     nearby=[]
     for hazard in hazards:
-        if not _is_active(hazard['expires_at']):
+        if not _is_active(hazard['expires_at'], hazard['observed_at']):
             continue
         km=distance_km(unit['latitude'],unit['longitude'],hazard['latitude'],hazard['longitude'])
         if km<=radius:

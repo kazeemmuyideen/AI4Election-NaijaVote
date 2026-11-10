@@ -16,16 +16,15 @@ const lang = document.querySelector('#language');
 const voiceLang={en:'en-NG',pcm:'en-NG',ha:'ha-NG',ig:'ig-NG',yo:'yo-NG'};
 lang.addEventListener('change', () => {
   const t = translations[lang.value] || translations.en;
-  document.querySelectorAll('.desktop-nav a').forEach((a,i)=>{const label=[t.ask,t.find,t.day][i];if(label)a.textContent=label;});
+  document.querySelectorAll('.desktop-nav a').forEach((a,i)=>{const label=[t.ask,t.find,t.day][i];if(label){a.textContent=label;a.lang=lang.value;}});
   const heroButton=document.querySelector('.hero-actions .button');
-  if(heroButton)heroButton.childNodes[0].textContent=t.start+' ';
+  if(heroButton){heroButton.childNodes[0].textContent=t.start+' ';heroButton.lang=lang.value;}
   const heroLink=document.querySelector('.hero-actions .text-link');
-  if(heroLink)heroLink.childNodes[0].textContent=t.lookup+' ';
+  if(heroLink){heroLink.childNodes[0].textContent=t.lookup+' ';heroLink.lang=lang.value;}
   const welcome=document.querySelector('.chat-content .bot-message');
-  if(welcome)welcome.textContent=t.welcome;
+  if(welcome){welcome.textContent=t.welcome;welcome.lang=lang.value;}
   const question=document.querySelector('#question');
-  if(question)question.placeholder=t.placeholder;
-  document.documentElement.lang=lang.value;
+  if(question){question.placeholder=t.placeholder;question.lang=lang.value;}
 });
 const chat = document.querySelector('#chat-content');
 function speakButton(text){
@@ -45,6 +44,7 @@ function speakButton(text){
 function addMessage(text, cls){
   const node=document.createElement('div');
   node.className=`chat-message ${cls}`;
+  node.lang=cls==='user-message'?lang.value:'en';
   node.append(document.createTextNode(text));
   if(cls==='bot-message')node.append(speakButton(text));
   chat.append(node);
@@ -53,13 +53,15 @@ function addMessage(text, cls){
 function addAnswer(result){
   const node=document.createElement('div');
   node.className='chat-message bot-message';
+  node.lang=result.language||'en';
   node.append(document.createTextNode(result.answer));
-  if(result.notice){const note=document.createElement('p');note.textContent=result.notice;node.append(note);}
+  if(result.notice){const note=document.createElement('p');note.lang='en';note.textContent=result.notice;node.append(note);}
   for(const source of result.citations||[]){
     const link=document.createElement('a');
     link.href=source.url;
     link.target='_blank';
     link.rel='noopener noreferrer';
+    link.lang='en';
     link.textContent=`Source: ${source.title} ↗`;
     node.append(link);
   }
@@ -68,6 +70,11 @@ function addAnswer(result){
   return node;
 }
 async function answerQuestion(question){
+  question=question.trim();
+  if(question.length<2||question.length>1000){
+    addMessage('Please enter a question between 2 and 1000 characters.','bot-message');
+    return;
+  }
   addMessage(question,'user-message');
   try{
     const response=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:lang.value})});
@@ -157,14 +164,25 @@ document.querySelector('#check-alerts').addEventListener('click',async()=>{
   if(!state){output.textContent='Choose your state first.';return;}
   output.textContent='Checking current advisories…';
   try{
-    const [riskRes,weatherRes]=await Promise.all([fetch(`/api/risk?state=${encodeURIComponent(state)}`),fetch(`/api/weather/${encodeURIComponent(state)}`)]);
-    if(!riskRes.ok||!weatherRes.ok)throw new Error('Advisory service unavailable');
-    const risk=await riskRes.json(),weather=await weatherRes.json();
-    const alertText=risk.alerts?.length
-      ?risk.alerts.map(a=>`${a.hazard}: ${a.details} (${a.severity}/100, ${a.source})`).join(' · ')
-      :'No current verified local hazard report is loaded. This does not mean the area is hazard-free.';
-    output.textContent=`${alertText} ${formatWeather(weather)}`;
-    document.querySelector('#alert-status').textContent=risk.alerts?.length?'Verified advisories available':weather.available?'Forecast available':'No live provider data';
+    const [riskResult,weatherResult]=await Promise.allSettled([
+      fetch(`/api/risk?state=${encodeURIComponent(state)}`),
+      fetch(`/api/weather/${encodeURIComponent(state)}`)
+    ]);
+    const riskResponse=riskResult.status==='fulfilled'?riskResult.value:null;
+    const weatherResponse=weatherResult.status==='fulfilled'?weatherResult.value:null;
+    const risk=riskResponse?.ok?await riskResponse.json():null;
+    const weather=weatherResponse?.ok?await weatherResponse.json():null;
+    const alertText=risk
+      ?risk.alerts?.length
+        ?risk.alerts.map(a=>`${a.hazard}: ${a.details} (${a.severity}/100, ${a.source})`).join(' · ')
+        :'No current verified local hazard report is loaded. This does not mean the area is hazard-free.'
+      :'Local hazard advisories are unavailable right now.';
+    const weatherText=weather?formatWeather(weather):'NiMet forecast is unavailable right now.';
+    output.textContent=`${alertText} ${weatherText}`;
+    document.querySelector('#alert-status').textContent=risk?.alerts?.length
+      ?'Verified advisories available'
+      :weather?.available?'Forecast available'
+      :risk?'No live provider data':'Advisories unavailable';
   }catch{
     output.textContent='Alert services are unavailable. Check NiMet and NIHSA directly before travel.';
   }
