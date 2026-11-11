@@ -34,8 +34,8 @@ For a container run, use the included `Dockerfile` and `docker-compose.yml` or p
 - Polling units are returned only from the local, source-attributed register. No fictitious locations are seeded. If a search has no data, the UI links to INEC's [official polling-unit locator](https://cvr.inecnigeria.org/pu).
 - Risk scores come only from current imported hazard reports. “Unknown” means there is no verified report in the local store; it does not mean safe. Imported scores are not a route-safety guarantee.
 - Polling-unit proximity checks require coordinates on both the unit and alert, and use the configurable `RISK_PROXIMITY_KM` radius (10 km by default). This is a proximity alert, not floodplain intersection or a dry-route calculation.
-- NiMet exposes protected data APIs. Provide the API key and the exact endpoint permitted for your account; `NIMET_ENDPOINT` is deliberately not guessed. The response is shown with retrieval time and the official NiMet source.
-- NIHSA feed synchronization accepts an authorized feed normalized to the documented JSON shape below. Full-resolution forecasts may require a subscription. Public NIHSA information remains linked even when no feed is configured.
+- Weather forecasts use Open-Meteo without an API key. They are third-party model forecasts for the state capital, not official NiMet forecasts or warnings. The endpoint returns a three-day forecast with retrieval time and attribution. Open-Meteo free access is for non-commercial use and requires attribution; check its current terms before deployment.
+- NIHSA feed synchronization accepts an authorized feed normalized to the documented JSON shape below. The official NIHSA website publishes seasonal outlooks and bulletins; these are distinct from live emergency alerts. Public NIHSA information remains linked even when no authorized feed is configured.
 - Browser speech recognition and speech synthesis depend on the visitor's browser and available voice/language packs.
 
 ## Polling-unit data import
@@ -51,9 +51,31 @@ curl -X POST http://localhost:8000/api/admin/import-polling-units \
 
 Required CSV headers: `state,lga,ward,name,code,source,source_url,verified_at`. Optional headers: `latitude,longitude,accessibility`. Use HTTPS official source links. The importer rejects empty required fields, non-HTTPS `source_url` values, and `verified_at` values that are not ISO-8601. Never add voters' names, VINs, phone numbers, or other personal registration data.
 
+### Fetching the INEC directory
+
+INEC publishes no bulk export — only the cascading locator at <https://cvr.inecnigeria.org/pu>. `scripts/fetch_inec_polling_units.py` walks that locator's public endpoints and writes a CSV in the import format above, including coordinates from each unit's map link:
+
+```sh
+# One state first, to check the output
+python scripts/fetch_inec_polling_units.py --states Lagos --limit 50 --out data/lagos.csv
+
+# Full national run (resumable; rerun the same command to continue)
+python scripts/fetch_inec_polling_units.py --out data/polling_units.inec.csv --rate 12 --workers 6
+```
+
+It is cached under `.cache/inec` (reruns are nearly free), throttled to `--rate` requests per second, and appends to the output file so an interrupted run resumes where it stopped. Expect several hours for all 176,846 units. Only run it with INEC's permission; it sets a browser User-Agent because the site's CDN rejects default Python clients, but it does not bypass any authentication.
+
+A nationwide CSV exceeds the admin endpoint's 20 MB upload cap, so import it directly with the same validation and stable ids:
+
+```sh
+python scripts/import_polling_units.py --db data/naijavote.db data/polling_units.inec.csv
+```
+
+Both scripts abort the whole import on the first invalid rows and report them with line numbers. The fetcher is standard-library only; the importer reuses the app's dependencies and validation models.
+
 ## Hazard data
 
-Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`, and `expires_at`; optional fields are `lga`, `ward`, `latitude`, and `longitude`. Source links must use HTTPS. `observed_at` and `expires_at` must be ISO-8601; values without a timezone are treated as UTC, and a date-only `expires_at` expires at 00:00 UTC (prefer a full datetime). Expired reports and legacy reports without an expiry are excluded from lookups.
+Submit an authorized normalized alert to `POST /api/admin/hazards` with `Authorization: Bearer …` and JSON fields `state`, `hazard`, `severity` (0–100), `details`, `source`, `source_url`, `observed_at`, and `expires_at`; optional fields are `lga`, `ward`, `latitude`, and `longitude`. Source links must use HTTPS. `observed_at` and `expires_at` must be ISO-8601; values without a timezone are treated as UTC, and a date-only `expires_at` expires at 00:00 UTC (prefer a full datetime). Expired reports, reports with a future observation time, and reports without an expiry are excluded from lookups.
 
 An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihsa`. It must be a trusted HTTPS URL whose JSON response is an array of those normalized alert objects, each citing an official `nihsa.gov.ng` URL. Reports with future observation times or expired timestamps, and legacy reports without an expiry, are excluded from risk lookups. Store feed credentials in `NIHSA_API_TOKEN`, not in source control. Run scheduled synchronization from a protected scheduler and monitor failures.
 
@@ -64,10 +86,11 @@ An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihs
 | GET | `/api/health` | Database row counts and configured integration status |
 | GET | `/api/config` | Supported interface languages and feature status |
 | POST | `/api/ask` | Source-cited civic Q&A; body: `{"question":"…","language":"en"}` |
-| GET | `/api/polling-units?state=Lagos&lga=Ikeja` | Search only imported verified records |
+| GET | `/api/polling-units?state=Lagos&lga=Ikeja&limit=20&offset=0` | Search sorted, paginated imported records |
+| GET | `/api/polling-units/{id}/weather` | Current Open-Meteo weather for the unit coordinates, or clearly labeled state-capital estimate |
 | GET | `/api/risk?state=Bayelsa&lga=…` | Current imported advisories and highest severity |
 | GET | `/api/polling-units/{id}/risk` | Current geolocated alerts within configured proximity of a unit |
-| GET | `/api/weather/{state}` | Optional NiMet account endpoint proxy |
+| GET | `/api/weather/{state}` | Three-day Open-Meteo forecast for the state capital (third-party, not NiMet) |
 | POST | `/api/admin/polling-units` | Add one source-attributed unit (admin bearer token) |
 | POST | `/api/admin/import-polling-units` | CSV import (admin bearer token) |
 | POST | `/api/admin/hazards` | Add one official-source hazard report (admin bearer token) |
@@ -81,4 +104,4 @@ See [.env.example](.env.example). Required for data administration: `ADMIN_API_T
 
 ## Production completion checklist
 
-Before serving a public election, load and audit official polling-unit records, confirm data publication/reuse rights with INEC, obtain and map NiMet account endpoints, contract/authorize the relevant NIHSA feed, have Nigerian-language answers independently reviewed by native civic/legal reviewers, and conduct load, accessibility, privacy, security, and nonpartisanship audits. Production should use PostgreSQL/PostGIS, encrypted managed secrets, backups, rate limits, monitoring, a static asset CDN, and a provider with an explicit SLA. The included SQLite setup is for local development and small demonstrations only. No route is labelled flood-safe until a current hazard dataset, geospatial intersection logic, and field validation are in place.
+Before serving a public election, load and audit official polling-unit records, confirm data publication/reuse rights with INEC, obtain and map NiMet account endpoints for official forecasts, contract/authorize an NIHSA feed for live advisories, have Nigerian-language answers independently reviewed by native civic/legal reviewers, and conduct load, accessibility, privacy, security, and nonpartisanship audits. Production should use PostgreSQL/PostGIS, encrypted managed secrets, backups, rate limits, monitoring, a static asset CDN, and a provider with an explicit SLA. The included SQLite setup is for local development and small demonstrations only. No route is labelled flood-safe until a current hazard dataset, geospatial intersection logic, and field validation are in place.

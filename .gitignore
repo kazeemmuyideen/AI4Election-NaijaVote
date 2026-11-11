@@ -6,4 +6,7 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/*.db-journal
+data/*.csv
+!data/polling_units.example.csv
+.cache/
 .pytest_cache/

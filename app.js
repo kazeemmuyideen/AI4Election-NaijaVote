@@ -87,32 +87,75 @@ async function answerQuestion(question){
 }
 document.querySelector('#chat-form').addEventListener('submit',e=>{e.preventDefault();const input=document.querySelector('#question');const q=input.value.trim();if(!q)return;answerQuestion(q);input.value='';});
 document.querySelectorAll('.suggestion').forEach(button=>button.addEventListener('click',()=>answerQuestion(button.dataset.question)));
+let activePollingSearch=null;
+const POLLING_PAGE_SIZE=20;
 document.querySelector('#lookup-form').addEventListener('submit',async e=>{
   e.preventDefault();
   const state=stateSelect.value;
   const rawArea=document.querySelector('#area').value.trim();
+  if(!state){document.querySelector('#lookup-result').textContent='Choose a state to continue.';return;}
+  let lga='',ward='';
+  if(rawArea.includes(',')){
+    [lga,ward]=rawArea.split(',',2).map(part=>part.trim());
+  }else{
+    const wardMatch=rawArea.match(/^(.+?)\s+ward\s+(.+)$/i);
+    if(wardMatch){lga=wardMatch[1].trim();ward=wardMatch[2].trim();}
+    else lga=rawArea;
+  }
+  activePollingSearch={state,lga,ward};
+  await loadPollingPage(0);
+});
+async function loadPollingPage(offset){
+  const {state,lga,ward}=activePollingSearch;
   const result=document.querySelector('#lookup-result');
-  if(!state){result.textContent='Choose a state to continue.';return;}
-  const [lga='',ward='']=rawArea.split(',').map(part=>part.trim());
   result.textContent='Searching verified local records…';
   try{
-    const params=new URLSearchParams({state});
+    const params=new URLSearchParams({state,limit:String(POLLING_PAGE_SIZE),offset:String(offset)});
     if(lga)params.set('lga',lga);
     if(ward)params.set('ward',ward);
     const response=await fetch(`/api/polling-units?${params}`);
     if(!response.ok)throw new Error('Lookup unavailable');
     const data=await response.json();
     if(data.results?.length){
-      result.replaceChildren(...data.results.map(unit=>{
+      const cards=data.results.map(unit=>{
         const item=document.createElement('article');
         item.className='unit-result';
         const label=document.createElement('strong');
         label.textContent=unit.name;
         const meta=document.createElement('span');
-        meta.textContent=`${unit.code} · ${unit.ward}, ${unit.lga}`;
+        meta.append(document.createTextNode(`${unit.code} · `));
+        const wardButton=document.createElement('button');
+        wardButton.type='button';
+        wardButton.className='ward-weather';
+        wardButton.textContent=unit.ward;
+        wardButton.setAttribute('aria-label',`Show current weather for ${unit.ward}, ${unit.lga}`);
+        meta.append(wardButton,document.createTextNode(`, ${unit.lga}`));
         const verify=document.createElement('small');
         verify.textContent=`Source: ${unit.source} · checked ${unit.verified_at}`;
-        item.append(label,meta,verify);
+        const weatherResult=document.createElement('p');
+        weatherResult.className='ward-weather-result';
+        weatherResult.hidden=true;
+        item.append(label,meta,verify,weatherResult);
+        wardButton.addEventListener('click',async()=>{
+          wardButton.disabled=true;
+          weatherResult.hidden=false;
+          weatherResult.textContent='Checking current weather…';
+          try{
+            const response=await fetch(`/api/polling-units/${encodeURIComponent(unit.id)}/weather`);
+            const currentWeather=await response.json();
+            if(!response.ok||!currentWeather.available)throw new Error('Weather unavailable');
+            const current=currentWeather.current||{};
+            const conditions=weatherCondition(current.weather_code);
+            const parts=[];
+            if(conditions)parts.push(conditions);
+            if(current.temperature_2m!==undefined)parts.push(`${current.temperature_2m}°C`);
+            if(current.apparent_temperature!==undefined)parts.push(`feels like ${current.apparent_temperature}°C`);
+            if(current.precipitation!==undefined)parts.push(`${current.precipitation} mm precipitation`);
+            weatherResult.textContent=`Current weather for ${currentWeather.location}: ${parts.join(' · ')}. ${currentWeather.location_note} Source: Open-Meteo.`;
+          }catch{
+            weatherResult.textContent='Current weather is temporarily unavailable. Please try again.';
+          }finally{wardButton.disabled=false;}
+        });
         if(unit.latitude!==null&&unit.longitude!==null){
           const map=document.createElement('a');
           map.href=`https://www.openstreetmap.org/?mlat=${unit.latitude}&mlon=${unit.longitude}#map=16/${unit.latitude}/${unit.longitude}`;
@@ -138,25 +181,61 @@ document.querySelector('#lookup-form').addEventListener('submit',async e=>{
           item.append(map,riskButton);
         }
         return item;
-      }));
+      });
+      if(data.notice){
+        const note=document.createElement('p');
+        note.className='lookup-note';
+        note.textContent=data.notice;
+        cards.push(note);
+      }
+      const pager=document.createElement('nav');
+      pager.className='polling-pager';
+      pager.setAttribute('aria-label','Polling unit result pages');
+      const summary=document.createElement('span');
+      summary.textContent=`Showing ${offset+1}–${Math.min(offset+data.count,data.total_count)} of ${data.total_count} polling units`;
+      pager.append(summary);
+      if(offset>0){
+        const previous=document.createElement('button');
+        previous.type='button';previous.textContent='Previous';
+        previous.addEventListener('click',()=>loadPollingPage(Math.max(0,offset-POLLING_PAGE_SIZE)));
+        pager.append(previous);
+      }
+      if(offset+data.count<data.total_count){
+        const next=document.createElement('button');
+        next.type='button';next.textContent='Next';
+        next.addEventListener('click',()=>loadPollingPage(offset+POLLING_PAGE_SIZE));
+        pager.append(next);
+      }
+      cards.push(pager);
+      result.replaceChildren(...cards);
     }else{
       result.textContent=data.notice||'No matching verified record found. Check your PVC or INEC’s official locator.';
     }
   }catch{
     result.textContent='Local lookup service is unavailable. Use INEC’s official polling-unit locator below.';
   }
-});
+}
+function weatherCondition(code){
+  const descriptions={0:'Clear',1:'Mostly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Depositing rime fog',
+    51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',56:'Freezing drizzle',57:'Heavy freezing drizzle',
+    61:'Light rain',63:'Rain',65:'Heavy rain',66:'Freezing rain',67:'Heavy freezing rain',71:'Light snow',
+    73:'Snow',75:'Heavy snow',77:'Snow grains',80:'Light rain showers',81:'Rain showers',82:'Heavy rain showers',
+    85:'Snow showers',86:'Heavy snow showers',95:'Thunderstorm',96:'Thunderstorm with hail',99:'Thunderstorm with heavy hail'};
+  return descriptions[code]||'';
+}
 function formatWeather(weather){
-  if(!weather.available)return weather.message||'NiMet forecast unavailable.';
+  if(!weather.available)return weather.message||'Weather forecast unavailable.';
   const data=weather.data;
-  if(data&&typeof data==='object'){
-    const parts=[];
-    for(const key of ['state','condition','description','temperature','temp','humidity','rainfall']){
-      if(data[key]!==undefined&&data[key]!==null)parts.push(`${key}: ${data[key]}`);
-    }
-    if(parts.length)return `NiMet forecast — ${parts.join(', ')}.`;
-  }
-  return 'NiMet forecast data is available.';
+  const current=data?.current||{};
+  const daily=data?.daily||{};
+  const high=daily.temperature_2m_max?.[0];
+  const low=daily.temperature_2m_min?.[0];
+  const rain=daily.precipitation_probability_max?.[0];
+  const parts=[];
+  if(current.temperature_2m!==undefined)parts.push(`${current.temperature_2m}°C now`);
+  if(low!==undefined&&high!==undefined)parts.push(`${low}–${high}°C today`);
+  if(rain!==undefined)parts.push(`${rain}% maximum rain chance today`);
+  return `${weather.provider||'Weather'} forecast for ${weather.location||weather.state}${parts.length?`: ${parts.join(', ')}`:''}. ${weather.attribution||'Third-party forecast only; official alerts are separate.'}`;
 }
 document.querySelector('#check-alerts').addEventListener('click',async()=>{
   const state=(alertState&&alertState.value)||stateSelect.value;
@@ -175,16 +254,16 @@ document.querySelector('#check-alerts').addEventListener('click',async()=>{
     const alertText=risk
       ?risk.alerts?.length
         ?risk.alerts.map(a=>`${a.hazard}: ${a.details} (${a.severity}/100, ${a.source})`).join(' · ')
-        :'No current verified local hazard report is loaded. This does not mean the area is hazard-free.'
+        :'No verified local hazard advisories are loaded. Check official alerts before travel; no report does not mean no risk.'
       :'Local hazard advisories are unavailable right now.';
-    const weatherText=weather?formatWeather(weather):'NiMet forecast is unavailable right now.';
+    const weatherText=weather?formatWeather(weather):'Weather forecast is unavailable right now.';
     output.textContent=`${alertText} ${weatherText}`;
     document.querySelector('#alert-status').textContent=risk?.alerts?.length
       ?'Verified advisories available'
-      :weather?.available?'Forecast available'
+      :weather?.available?'Open-Meteo forecast · no verified alerts'
       :risk?'No live provider data':'Advisories unavailable';
   }catch{
-    output.textContent='Alert services are unavailable. Check NiMet and NIHSA directly before travel.';
+    output.textContent='Forecast and local advisory services are unavailable. Check official weather and emergency sources before travel.';
   }
 });
 const voiceButton=document.querySelector('#voice-button');

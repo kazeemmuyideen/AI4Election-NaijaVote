@@ -144,7 +144,11 @@ def test_like_wildcards_are_escaped(client):
 
 def test_hazard_expiry_uses_timezones(client):
     for hazard in (
-        _hazard(hazard="already-expired", expires_at="2020-01-01T00:00:00+14:00"),
+        _hazard(
+            hazard="already-expired",
+            observed_at="2019-01-01T00:00:00+00:00",
+            expires_at="2020-01-01T00:00:00+14:00",
+        ),
         _hazard(hazard="still-active", expires_at="2099-01-01T00:00:00+00:00"),
     ):
         assert client.post("/api/admin/hazards", headers=ADMIN, json=hazard).status_code == 200

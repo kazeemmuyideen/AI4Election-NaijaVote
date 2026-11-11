@@ -319,11 +319,11 @@ def _grounded_answer(query: str, language: str = "en") -> dict[str, Any]:
 def health():
     with db() as con:
         counts={t:con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("polling_units","hazard_reports","knowledge")}
-    return {"status":"ok","data":counts,"integrations":{"inec_directory":counts['polling_units']>0,"nimet":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"nihsa_feed":bool(os.getenv('NIHSA_FEED_URL')),"llm":bool(os.getenv('LLM_API_KEY')),"whatsapp":bool(os.getenv('TWILIO_AUTH_TOKEN'))}}
+    return {"status":"ok","data":counts,"integrations":{"inec_directory":counts['polling_units']>0,"open_meteo":True,"nimet":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"nihsa_feed":bool(os.getenv('NIHSA_FEED_URL')),"llm":bool(os.getenv('LLM_API_KEY')),"whatsapp":bool(os.getenv('TWILIO_AUTH_TOKEN'))}}
 
 @app.get("/api/config")
 def config():
-    return {"languages":[{"code":"en","name":"English"},{"code":"pcm","name":"Nigerian Pidgin"},{"code":"ha","name":"Hausa"},{"code":"ig","name":"Igbo"},{"code":"yo","name":"Yorùbá"}],"official_locator":INEC_URL,"features":{"voice_input":True,"voice_output":True,"live_weather":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"polling_unit_lookup":True}}
+    return {"languages":[{"code":"en","name":"English"},{"code":"pcm","name":"Nigerian Pidgin"},{"code":"ha","name":"Hausa"},{"code":"ig","name":"Igbo"},{"code":"yo","name":"Yorùbá"}],"official_locator":INEC_URL,"features":{"voice_input":True,"voice_output":True,"live_weather":True,"weather_provider":"Open-Meteo (third-party; not NiMet)","polling_unit_lookup":True}}
 
 @app.post("/api/ask")
 async def ask(payload: AskRequest, request: Request):
@@ -350,15 +350,43 @@ async def ask(payload: AskRequest, request: Request):
     return result
 
 @app.get("/api/polling-units")
-def polling_units(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = "", q: str = "", limit: int = Query(default=20, ge=1, le=100)):
+def polling_units(
+    state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = "",
+    q: str = "", limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
     state=state.strip()
     if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
     if lga: clauses.append("(lga LIKE ? ESCAPE '\\' OR ward LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(lga)}%",f"%{_like(lga)}%"])
     if ward: clauses.append("ward LIKE ? ESCAPE '\\'"); args.append(f"%{_like(ward)}%")
     if q: clauses.append("(name LIKE ? ESCAPE '\\' OR code LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(q)}%",f"%{_like(q)}%"])
-    with db() as con: rows=con.execute(f"SELECT * FROM polling_units WHERE {' AND '.join(clauses)} ORDER BY lga,ward,name LIMIT ?",(*args,limit)).fetchall()
-    return {"results":[dict(r) for r in rows],"count":len(rows),"source":"source-attributed local register","official_locator":INEC_URL,"notice":None if rows else "No verified polling units were found in the local data. Use INEC’s official locator for your assigned unit."}
+    effective_clauses,effective_args=list(clauses),list(args)
+    with db() as con:
+        loaded_states=[row[0] for row in con.execute("SELECT DISTINCT state FROM polling_units ORDER BY state").fetchall()]
+        total=con.execute(f"SELECT count(*) FROM polling_units WHERE {' AND '.join(effective_clauses)}",effective_args).fetchone()[0]
+        ward_fallback=False
+        if total==0 and lga and ward:
+            effective_clauses=[clause for clause in clauses if not clause.startswith("ward LIKE")]
+            effective_args=args[:-1]
+            total=con.execute(f"SELECT count(*) FROM polling_units WHERE {' AND '.join(effective_clauses)}",effective_args).fetchone()[0]
+            ward_fallback=total>0
+        rows=con.execute(
+            f"SELECT * FROM polling_units WHERE {' AND '.join(effective_clauses)} ORDER BY lga,ward,name LIMIT ? OFFSET ?",
+            (*effective_args,limit,offset),
+        ).fetchall()
+    notice=None
+    if total==0:
+        matched_state=any(state.casefold() in item.casefold() or item.casefold() in state.casefold() for item in loaded_states)
+        if matched_state:
+            notice=f"No local polling units matched this search in {state}. Confirm the LGA or ward, or use INEC’s official locator."
+        else:
+            coverage=(f"The local directory currently covers {len(loaded_states)} of 37 states/FCT"
+                      + (f" ({', '.join(loaded_states)}). " if loaded_states else ". "))
+            notice=f"No local polling-unit records are loaded for {state} yet. {coverage}Use INEC’s official locator for your assigned unit."
+    elif ward_fallback:
+        notice=f"No local registration area matched ‘{ward}’ in {lga}. Showing records from the LGA; check your PVC or INEC’s official locator to confirm your assigned unit."
+    return {"results":[dict(r) for r in rows],"count":len(rows),"total_count":total,"limit":limit,"offset":offset,"source":"source-attributed local register","coverage":{"loaded_states":loaded_states,"loaded_state_count":len(loaded_states),"total_states_and_fct":37},"official_locator":INEC_URL,"notice":notice}
 
 @app.get("/api/risk")
 def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = ""):
@@ -400,17 +428,87 @@ def unit_risk(unit_id: str):
     score=max((item['severity'] for item in nearby),default=None)
     return {"polling_unit":unit['name'],"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","risk_score":score,"proximity_radius_km":radius,"alerts":nearby,"note":"Only current geolocated reports within the configured proximity radius are included. Unknown means no matching report is available; it does not mean safe."}
 
+WEATHER_LOCATIONS = {
+    "abia": (5.532, 7.486, "Umuahia"), "adamawa": (9.204, 12.495, "Yola"),
+    "akwa ibom": (5.051, 7.933, "Uyo"), "anambra": (6.210, 7.074, "Awka"),
+    "bauchi": (10.310, 9.844, "Bauchi"), "bayelsa": (4.926, 6.267, "Yenagoa"),
+    "benue": (7.732, 8.539, "Makurdi"), "borno": (11.833, 13.150, "Maiduguri"),
+    "cross river": (4.958, 8.326, "Calabar"), "delta": (5.532, 5.898, "Asaba"),
+    "ebonyi": (6.264, 8.013, "Abakaliki"), "edo": (6.335, 5.603, "Benin City"),
+    "ekiti": (7.623, 5.221, "Ado-Ekiti"), "enugu": (6.458, 7.546, "Enugu"),
+    "gombe": (10.290, 11.168, "Gombe"), "imo": (5.489, 7.026, "Owerri"),
+    "jigawa": (12.000, 8.516, "Dutse"), "kaduna": (10.523, 7.438, "Kaduna"),
+    "kano": (12.002, 8.592, "Kano"), "katsina": (12.990, 7.601, "Katsina"),
+    "kebbi": (12.453, 4.197, "Birnin Kebbi"), "kogi": (7.802, 6.734, "Lokoja"),
+    "kwara": (8.496, 4.542, "Ilorin"), "lagos": (6.524, 3.379, "Ikeja"),
+    "nasarawa": (8.537, 8.522, "Lafia"), "niger": (9.616, 6.547, "Minna"),
+    "ogun": (7.147, 3.361, "Abeokuta"), "ondo": (7.252, 5.210, "Akure"),
+    "osun": (7.782, 4.541, "Oshogbo"), "oyo": (7.377, 3.947, "Ibadan"),
+    "plateau": (9.929, 8.892, "Jos"), "rivers": (4.815, 7.050, "Port Harcourt"),
+    "sokoto": (13.062, 5.243, "Sokoto"), "taraba": (8.892, 11.359, "Jalingo"),
+    "yobe": (11.748, 11.966, "Damaturu"), "zamfara": (12.170, 6.664, "Gusau"),
+    "fct": (9.058, 7.495, "Abuja"), "abuja": (9.058, 7.495, "Abuja"),
+    "federal capital territory": (9.058, 7.495, "Abuja"),
+}
+
 @app.get("/api/weather/{state}")
 async def weather(state: str):
-    key=os.getenv("NIMET_API_KEY"); endpoint=os.getenv("NIMET_ENDPOINT")
-    if not key or not endpoint: return {"available":False,"message":"NiMet API access is not configured.","source":SOURCES['NiMet']}
-    if not endpoint.startswith("https://"): raise HTTPException(500,"NIMET_ENDPOINT must use HTTPS")
+    location=WEATHER_LOCATIONS.get(state.strip().casefold())
+    if not location:
+        raise HTTPException(404,"Weather is available for Nigerian states and the FCT only")
+    latitude,longitude,city=location
     try:
         async with httpx.AsyncClient(timeout=12) as client:
-            response=await client.get(endpoint,params={"state":state},headers={"x-api-key":key}); response.raise_for_status()
-        return {"available":True,"data":response.json(),"source":SOURCES['NiMet'],"retrieved_at":datetime.now(timezone.utc).isoformat()}
+            response=await client.get("https://api.open-meteo.com/v1/forecast",params={
+                "latitude":latitude,"longitude":longitude,
+                "current":"temperature_2m,precipitation,weather_code",
+                "daily":"temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
+                "forecast_days":3,"timezone":"Africa/Lagos",
+            })
+            response.raise_for_status(); data=response.json()
+        return {"available":True,"provider":"Open-Meteo","official":False,
+                "location":city,"state":state,"data":data,
+                "source":"https://open-meteo.com/","attribution":"Third-party forecast only; official weather and emergency alerts are separate.",
+                "retrieved_at":datetime.now(timezone.utc).isoformat()}
     except (httpx.HTTPError,ValueError) as exc:
-        return JSONResponse(status_code=502,content={"available":False,"message":"NiMet could not provide an update right now.","source":SOURCES['NiMet']})
+        return JSONResponse(status_code=502,content={"available":False,"provider":"Open-Meteo",
+            "message":"The third-party forecast is temporarily unavailable. Check official weather guidance.",
+            "source":"https://open-meteo.com/"})
+
+@app.get("/api/polling-units/{unit_id}/weather")
+async def polling_unit_weather(unit_id: str):
+    with db() as con:
+        unit=con.execute("SELECT id,state,lga,ward,latitude,longitude FROM polling_units WHERE id=?",(unit_id,)).fetchone()
+    if not unit:
+        raise HTTPException(404,"Polling unit not found in the local register")
+    exact=unit["latitude"] is not None and unit["longitude"] is not None
+    if exact:
+        latitude,longitude=float(unit["latitude"]),float(unit["longitude"])
+        location=f"{unit['ward']}, {unit['lga']}"
+        location_note="Coordinates from the polling-unit record"
+    else:
+        fallback=WEATHER_LOCATIONS.get(unit["state"].strip().casefold())
+        if not fallback:
+            raise HTTPException(404,"Weather is not available for this state")
+        latitude,longitude,capital=fallback
+        location=f"{capital} (state-capital estimate)"
+        location_note="This polling-unit record has no coordinates; showing state-capital conditions."
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response=await client.get("https://api.open-meteo.com/v1/forecast",params={
+                "latitude":latitude,"longitude":longitude,
+                "current":"temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+                "timezone":"Africa/Lagos",
+            })
+            response.raise_for_status(); data=response.json()
+        return {"available":True,"provider":"Open-Meteo","location":location,
+                "location_note":location_note,"current":data.get("current",{}),
+                "retrieved_at":datetime.now(timezone.utc).isoformat(),
+                "source":"https://open-meteo.com/"}
+    except (httpx.HTTPError,ValueError):
+        return JSONResponse(status_code=502,content={"available":False,"provider":"Open-Meteo",
+            "message":"Current weather is temporarily unavailable. Please try again.",
+            "source":"https://open-meteo.com/"})
 
 def require_admin(authorization: str = Header(default="")) -> None:
     token=os.getenv("ADMIN_API_TOKEN")
