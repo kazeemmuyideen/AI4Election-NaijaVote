@@ -352,7 +352,7 @@ async def ask(payload: AskRequest, request: Request):
 @app.get("/api/polling-units")
 def polling_units(
     state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = "",
-    q: str = "", limit: int = Query(default=20, ge=1, le=100),
+    q: str = "", limit: int = Query(default=20, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     state=state.strip()
@@ -387,6 +387,22 @@ def polling_units(
     elif ward_fallback:
         notice=f"No local registration area matched ‘{ward}’ in {lga}. Showing records from the LGA; check your PVC or INEC’s official locator to confirm your assigned unit."
     return {"results":[dict(r) for r in rows],"count":len(rows),"total_count":total,"limit":limit,"offset":offset,"source":"source-attributed local register","coverage":{"loaded_states":loaded_states,"loaded_state_count":len(loaded_states),"total_states_and_fct":37},"official_locator":INEC_URL,"notice":notice}
+
+@app.get("/api/polling-unit-areas")
+def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: str = ""):
+    state=state.strip()
+    with db() as con:
+        if lga:
+            rows=con.execute(
+                "SELECT DISTINCT ward FROM polling_units WHERE state=? COLLATE NOCASE AND lga=? COLLATE NOCASE ORDER BY ward",
+                (state,lga),
+            ).fetchall()
+            return {"state":state,"lga":lga,"areas":[row[0] for row in rows]}
+        rows=con.execute(
+            "SELECT DISTINCT lga FROM polling_units WHERE state=? COLLATE NOCASE ORDER BY lga",
+            (state,),
+        ).fetchall()
+    return {"state":state,"areas":[row[0] for row in rows]}
 
 @app.get("/api/risk")
 def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = ""):

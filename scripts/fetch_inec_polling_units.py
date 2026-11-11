@@ -153,6 +153,8 @@ class Client:
                     json.dump(payload, fh)
                 os.replace(tmp, path)
                 return status, headers, text
+            if status == 403:
+                raise RuntimeError(f"HTTP 403 for {url}")
             if status in (403, 429, 500, 502, 503, 504):
                 last_error = RuntimeError(f"HTTP {status} for {url}")
                 time.sleep(min(2**attempt, 60))
@@ -339,7 +341,20 @@ def main() -> int:
 
     total_written = 0
     skipped = 0
+    consecutive_forbidden = 0
     started = time.monotonic()
+    failures_path = out.with_name(f"{out.stem}.failed.csv")
+
+    def record_forbidden(state_name, lga_name, ward_name, area_id, exc):
+        if not failures_path.exists():
+            with failures_path.open("w", newline="", encoding="utf-8") as failures:
+                csv.writer(failures).writerow(
+                    ["state", "lga", "ward", "registration_area_id", "error"]
+                )
+        with failures_path.open("a", newline="", encoding="utf-8") as failures:
+            csv.writer(failures).writerow(
+                [state_name, lga_name, ward_name, area_id, str(exc)]
+            )
 
     def process(task):
         (internal, official, state_name, lga_id, lga_num, lga_name, ward_id,
@@ -365,14 +380,41 @@ def main() -> int:
                 print(f"  skipping LGA without code: {lga_label}", file=sys.stderr)
                 continue
             lga_name = tidy(lga_name)
-            state_wards = wards(client, lga_id)
+            try:
+                state_wards = wards(client, lga_id)
+                consecutive_forbidden = 0
+            except RuntimeError as exc:
+                if "HTTP 403" not in str(exc):
+                    raise
+                record_forbidden(state_name, lga_name, "", lga_id, exc)
+                consecutive_forbidden += 1
+                print(
+                    f"  {state_name}/{lga_name}: ward list HTTP 403; recorded in {failures_path} and skipped",
+                    file=sys.stderr,
+                )
+                if consecutive_forbidden >= 2:
+                    raise RuntimeError(
+                        "Two consecutive HTTP 403 responses; stopping to respect INEC’s access controls"
+                    ) from exc
+                continue
             for ward_id, ward_label in state_wards:
                 ward_num, ward_name = strip_prefix(ward_label)
                 if not ward_num:
                     print(f"  skipping ward without code: {ward_label}", file=sys.stderr)
                     continue
                 ward_name = tidy(ward_name)
-                units = polling_units(client, ward_id)
+                try:
+                    units = polling_units(client, ward_id)
+                    consecutive_forbidden = 0
+                except RuntimeError as exc:
+                    if "HTTP 403" not in str(exc):
+                        raise
+                    record_forbidden(state_name, lga_name, ward_name, ward_id, exc)
+                    consecutive_forbidden += 1
+                    print(f"  {state_name}/{lga_name}/{ward_name}: HTTP 403; recorded in {failures_path} and skipped", file=sys.stderr)
+                    if consecutive_forbidden >= 2:
+                        raise RuntimeError("Two consecutive HTTP 403 responses; stopping to respect INEC’s access controls") from exc
+                    continue
                 if args.limit:
                     remaining = args.limit - total_written
                     if remaining <= 0:

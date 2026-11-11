@@ -87,6 +87,7 @@ An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihs
 | GET | `/api/config` | Supported interface languages and feature status |
 | POST | `/api/ask` | Source-cited civic Q&A; body: `{"question":"…","language":"en"}` |
 | GET | `/api/polling-units?state=Lagos&lga=Ikeja&limit=20&offset=0` | Search sorted, paginated imported records |
+| GET | `/api/polling-unit-areas?state=Lagos` | List imported LGAs for a state; add `lga=Ikeja` to list its wards |
 | GET | `/api/polling-units/{id}/weather` | Current Open-Meteo weather for the unit coordinates, or clearly labeled state-capital estimate |
 | GET | `/api/risk?state=Bayelsa&lga=…` | Current imported advisories and highest severity |
 | GET | `/api/polling-units/{id}/risk` | Current geolocated alerts within configured proximity of a unit |

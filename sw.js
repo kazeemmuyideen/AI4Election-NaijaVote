@@ -1,4 +1,4 @@
-const CACHE='naijavote-shell-v5';
+const CACHE='naijavote-shell-v7';
 const SHELL=['/','/index.html','/styles.css','/app.js','/manifest.webmanifest','/favicon.svg','/icon-192.png','/icon-512.png'];
 
 self.addEventListener('install',event=>{

@@ -88,29 +88,58 @@ async function answerQuestion(question){
 document.querySelector('#chat-form').addEventListener('submit',e=>{e.preventDefault();const input=document.querySelector('#question');const q=input.value.trim();if(!q)return;answerQuestion(q);input.value='';});
 document.querySelectorAll('.suggestion').forEach(button=>button.addEventListener('click',()=>answerQuestion(button.dataset.question)));
 let activePollingSearch=null;
-const POLLING_PAGE_SIZE=20;
+const lgaSelect=document.querySelector('#lga');
+const wardSelect=document.querySelector('#ward');
+const lookupSubmit=document.querySelector('#lookup-submit');
+function resetSelect(select,placeholder){
+  select.replaceChildren(new Option(placeholder,''));
+  select.disabled=true;
+}
+async function loadPollingAreas(state,lga=''){
+  const params=new URLSearchParams({state});
+  if(lga)params.set('lga',lga);
+  const response=await fetch(`/api/polling-unit-areas?${params}`);
+  if(!response.ok)throw new Error('Area list unavailable');
+  return (await response.json()).areas||[];
+}
+stateSelect.addEventListener('change',async()=>{
+  resetSelect(lgaSelect,'Loading LGAs…');
+  resetSelect(wardSelect,'Select a ward');
+  lookupSubmit.disabled=true;
+  document.querySelector('#lookup-result').replaceChildren();
+  if(!stateSelect.value){resetSelect(lgaSelect,'Select an LGA');return;}
+  try{
+    const lgas=await loadPollingAreas(stateSelect.value);
+    lgaSelect.replaceChildren(new Option(lgas.length?'Select an LGA':'No local LGAs loaded',''),...lgas.map(area=>new Option(area,area)));
+    lgaSelect.disabled=!lgas.length;
+  }catch{resetSelect(lgaSelect,'Could not load LGAs');}
+});
+lgaSelect.addEventListener('change',async()=>{
+  resetSelect(wardSelect,'Loading wards…');
+  lookupSubmit.disabled=true;
+  document.querySelector('#lookup-result').replaceChildren();
+  if(!lgaSelect.value){resetSelect(wardSelect,'Select a ward');return;}
+  try{
+    const wards=await loadPollingAreas(stateSelect.value,lgaSelect.value);
+    wardSelect.replaceChildren(new Option(wards.length?'Select a ward':'No local wards loaded',''),...wards.map(area=>new Option(area,area)));
+    wardSelect.disabled=!wards.length;
+  }catch{resetSelect(wardSelect,'Could not load wards');}
+});
+wardSelect.addEventListener('change',()=>{lookupSubmit.disabled=!wardSelect.value;});
 document.querySelector('#lookup-form').addEventListener('submit',async e=>{
   e.preventDefault();
   const state=stateSelect.value;
-  const rawArea=document.querySelector('#area').value.trim();
-  if(!state){document.querySelector('#lookup-result').textContent='Choose a state to continue.';return;}
-  let lga='',ward='';
-  if(rawArea.includes(',')){
-    [lga,ward]=rawArea.split(',',2).map(part=>part.trim());
-  }else{
-    const wardMatch=rawArea.match(/^(.+?)\s+ward\s+(.+)$/i);
-    if(wardMatch){lga=wardMatch[1].trim();ward=wardMatch[2].trim();}
-    else lga=rawArea;
-  }
+  const lga=lgaSelect.value,ward=wardSelect.value;
+  if(!state||!lga||!ward)return;
   activePollingSearch={state,lga,ward};
-  await loadPollingPage(0);
+  await loadPollingUnits();
 });
-async function loadPollingPage(offset){
+async function loadPollingUnits(){
   const {state,lga,ward}=activePollingSearch;
   const result=document.querySelector('#lookup-result');
   result.textContent='Searching verified local records…';
   try{
-    const params=new URLSearchParams({state,limit:String(POLLING_PAGE_SIZE),offset:String(offset)});
+    const params=new URLSearchParams({state,lga,ward,limit:'500'});
     if(lga)params.set('lga',lga);
     if(ward)params.set('ward',ward);
     const response=await fetch(`/api/polling-units?${params}`);
@@ -156,6 +185,17 @@ async function loadPollingPage(offset){
             weatherResult.textContent='Current weather is temporarily unavailable. Please try again.';
           }finally{wardButton.disabled=false;}
         });
+        const destination=unit.latitude!==null&&unit.longitude!==null
+          ?`${unit.latitude},${unit.longitude}`
+          :`${unit.name}, ${unit.ward}, ${unit.lga}, ${unit.state}, Nigeria`;
+        const directions=document.createElement('a');
+        directions.className='unit-directions';
+        directions.href=`https://www.google.com/maps/dir/?api=1&${new URLSearchParams({destination,travelmode:'driving'})}`;
+        directions.target='_blank';
+        directions.rel='noopener noreferrer';
+        directions.textContent=unit.latitude!==null&&unit.longitude!==null?'Get directions ↗':'Find on map (approximate) ↗';
+        directions.setAttribute('aria-label',`${unit.latitude!==null&&unit.longitude!==null?'Get directions to':'Find approximate map location for'} ${unit.name}, ${unit.ward}, ${unit.lga}`);
+        item.append(directions);
         if(unit.latitude!==null&&unit.longitude!==null){
           const map=document.createElement('a');
           map.href=`https://www.openstreetmap.org/?mlat=${unit.latitude}&mlon=${unit.longitude}#map=16/${unit.latitude}/${unit.longitude}`;
@@ -188,25 +228,11 @@ async function loadPollingPage(offset){
         note.textContent=data.notice;
         cards.push(note);
       }
-      const pager=document.createElement('nav');
-      pager.className='polling-pager';
-      pager.setAttribute('aria-label','Polling unit result pages');
-      const summary=document.createElement('span');
-      summary.textContent=`Showing ${offset+1}–${Math.min(offset+data.count,data.total_count)} of ${data.total_count} polling units`;
-      pager.append(summary);
-      if(offset>0){
-        const previous=document.createElement('button');
-        previous.type='button';previous.textContent='Previous';
-        previous.addEventListener('click',()=>loadPollingPage(Math.max(0,offset-POLLING_PAGE_SIZE)));
-        pager.append(previous);
-      }
-      if(offset+data.count<data.total_count){
-        const next=document.createElement('button');
-        next.type='button';next.textContent='Next';
-        next.addEventListener('click',()=>loadPollingPage(offset+POLLING_PAGE_SIZE));
-        pager.append(next);
-      }
-      cards.push(pager);
+      const summary=document.createElement('p');
+      summary.className='polling-count';
+      summary.textContent=data.total_count===1?'1 polling unit in this ward':`${data.total_count} polling units in this ward`;
+      if(data.total_count>data.count)summary.textContent+=` (first ${data.count} shown)`;
+      cards.unshift(summary);
       result.replaceChildren(...cards);
     }else{
       result.textContent=data.notice||'No matching verified record found. Check your PVC or INEC’s official locator.';
