@@ -114,7 +114,7 @@ FAQ: list[dict[str, Any]] = [
     {"id":"secret", "keywords":["secret","privacy","ballot","private"], "question":"Is my vote secret?", "answer":"Yes. Mark your ballot privately in the voting cubicle. Do not show or photograph your marked ballot.", "source":"INEC voter education", "source_url":SOURCES["INEC"], "language":"en"},
     {"id":"priority", "keywords":["priority","elderly","old","pregnant","nursing","breastfeeding","queue"], "question":"Who can receive priority access?", "answer":"INEC’s election guidelines provide priority access for persons with disabilities, visibly pregnant women, nursing or breastfeeding mothers, and elderly voters. Ask an official at your polling unit for the priority queue and confirm current procedures with INEC.", "source":"INEC election guidelines", "source_url":"https://www.inecnigeria.org/elections/guidelines", "language":"en"},
     {"id":"disability", "keywords":["disability","disabled","pwd","wheelchair","blind","accessibility","assistance"], "question":"Can I get assistance to vote?", "answer":"Voters with disabilities can request assistance at the polling unit. Ask an INEC official about the current procedure and available accessibility arrangements for your location.", "source":"INEC", "source_url":SOURCES["INEC"], "language":"en"},
-    {"id":"locate", "keywords":["polling unit","where vote","location","find my","ward","lga"], "question":"How do I find my polling unit?", "answer":"Use INEC’s official polling-unit locator and check the polling-unit details on your PVC. This service does not have a verified nationwide polling-unit register loaded yet.", "source":"INEC polling unit locator", "source_url":INEC_URL, "language":"en"},
+    {"id":"locate", "keywords":["polling unit","where vote","location","find my","ward","lga"], "question":"How do I find my polling unit?", "answer":"This service has polling-unit records from INEC’s public locator for all 36 states and the FCT, though some individual areas may not have locally loaded unit details. Confirm your assigned unit with INEC’s official locator and the details on your PVC.", "source":"INEC polling unit locator", "source_url":INEC_URL, "language":"en"},
     {"id":"weather", "keywords":["weather","flood","rain","heat","route","safe"], "question":"How should I plan around weather?", "answer":"Check current alerts from NiMet and NIHSA before travelling, then follow local emergency guidance. This service does not have a live forecast feed or verified polling-unit route data connected yet.", "source":"NiMet", "source_url":SOURCES["NiMet"], "language":"en"},
 ]
 
@@ -143,6 +143,15 @@ def init_db() -> None:
           source_url TEXT NOT NULL, verified_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS pu_search ON polling_units(state, lga, ward);
+        CREATE TABLE IF NOT EXISTS polling_area_gaps (
+          state TEXT NOT NULL, lga TEXT NOT NULL, ward TEXT NOT NULL,
+          listed_unit_count INTEGER, source TEXT NOT NULL, source_url TEXT NOT NULL,
+          PRIMARY KEY(state, lga, ward)
+        );
+        INSERT OR IGNORE INTO polling_area_gaps
+          (state, lga, ward, listed_unit_count, source, source_url)
+          VALUES ('Sokoto', 'Shagari', 'Horo Birni', 10, 'INEC Directory of Polling Units 2022',
+                  'https://inecnigeria.org/wp-content/uploads/2023/01/SOKOTO.pdf');
         CREATE TABLE IF NOT EXISTS hazard_reports (
           id TEXT PRIMARY KEY, state TEXT NOT NULL, lga TEXT, ward TEXT,
           latitude REAL, longitude REAL, hazard TEXT NOT NULL, severity INTEGER NOT NULL,
@@ -361,31 +370,34 @@ def polling_units(
     if lga: clauses.append("(lga LIKE ? ESCAPE '\\' OR ward LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(lga)}%",f"%{_like(lga)}%"])
     if ward: clauses.append("ward LIKE ? ESCAPE '\\'"); args.append(f"%{_like(ward)}%")
     if q: clauses.append("(name LIKE ? ESCAPE '\\' OR code LIKE ? ESCAPE '\\')"); args.extend([f"%{_like(q)}%",f"%{_like(q)}%"])
-    effective_clauses,effective_args=list(clauses),list(args)
     with db() as con:
         loaded_states=[row[0] for row in con.execute("SELECT DISTINCT state FROM polling_units ORDER BY state").fetchall()]
-        total=con.execute(f"SELECT count(*) FROM polling_units WHERE {' AND '.join(effective_clauses)}",effective_args).fetchone()[0]
-        ward_fallback=False
-        if total==0 and lga and ward:
-            effective_clauses=[clause for clause in clauses if not clause.startswith("ward LIKE")]
-            effective_args=args[:-1]
-            total=con.execute(f"SELECT count(*) FROM polling_units WHERE {' AND '.join(effective_clauses)}",effective_args).fetchone()[0]
-            ward_fallback=total>0
+        total=con.execute(f"SELECT count(*) FROM polling_units WHERE {' AND '.join(clauses)}",args).fetchone()[0]
         rows=con.execute(
-            f"SELECT * FROM polling_units WHERE {' AND '.join(effective_clauses)} ORDER BY lga,ward,name LIMIT ? OFFSET ?",
-            (*effective_args,limit,offset),
+            f"SELECT * FROM polling_units WHERE {' AND '.join(clauses)} ORDER BY lga,ward,name LIMIT ? OFFSET ?",
+            (*args,limit,offset),
         ).fetchall()
+        gap=None
+        if total==0 and lga and ward:
+            gap=con.execute(
+                "SELECT listed_unit_count FROM polling_area_gaps WHERE state=? COLLATE NOCASE AND lga=? COLLATE NOCASE AND ward=? COLLATE NOCASE",
+                (state,lga,ward),
+            ).fetchone()
     notice=None
     if total==0:
         matched_state=any(state.casefold() in item.casefold() or item.casefold() in state.casefold() for item in loaded_states)
         if matched_state:
-            notice=f"No local polling units matched this search in {state}. Confirm the LGA or ward, or use INEC’s official locator."
+            if gap:
+                count_note=(f" INEC’s 2022 directory lists {gap['listed_unit_count']} polling units for this area." if gap['listed_unit_count'] is not None else "")
+                notice=f"Individual polling-unit details for {ward}, {lga}, {state} are not loaded locally.{count_note} Use INEC’s official locator to confirm the unit names and your assignment."
+            elif ward:
+                notice=f"No local polling-unit records matched {ward}, {lga}, {state}. No records from other wards are shown. Confirm your assigned unit with INEC’s official locator."
+            else:
+                notice=f"No local polling units matched this search in {state}. Confirm the LGA or ward, or use INEC’s official locator."
         else:
             coverage=(f"The local directory currently covers {len(loaded_states)} of 37 states/FCT"
                       + (f" ({', '.join(loaded_states)}). " if loaded_states else ". "))
             notice=f"No local polling-unit records are loaded for {state} yet. {coverage}Use INEC’s official locator for your assigned unit."
-    elif ward_fallback:
-        notice=f"No local registration area matched ‘{ward}’ in {lga}. Showing records from the LGA; check your PVC or INEC’s official locator to confirm your assigned unit."
     return {"results":[dict(r) for r in rows],"count":len(rows),"total_count":total,"limit":limit,"offset":offset,"source":"source-attributed local register","coverage":{"loaded_states":loaded_states,"loaded_state_count":len(loaded_states),"total_states_and_fct":37},"official_locator":INEC_URL,"notice":notice}
 
 @app.get("/api/polling-unit-areas")
@@ -394,8 +406,9 @@ def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: st
     with db() as con:
         if lga:
             rows=con.execute(
-                "SELECT DISTINCT ward FROM polling_units WHERE state=? COLLATE NOCASE AND lga=? COLLATE NOCASE ORDER BY ward",
-                (state,lga),
+                "SELECT ward FROM polling_units WHERE state=? COLLATE NOCASE AND lga=? COLLATE NOCASE "
+                "UNION SELECT ward FROM polling_area_gaps WHERE state=? COLLATE NOCASE AND lga=? COLLATE NOCASE ORDER BY ward",
+                (state,lga,state,lga),
             ).fetchall()
             return {"state":state,"lga":lga,"areas":[row[0] for row in rows]}
         rows=con.execute(
