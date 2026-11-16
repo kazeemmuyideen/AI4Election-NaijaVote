@@ -177,5 +177,12 @@ def test_ask_is_rate_limited(client, monkeypatch):
 def test_config_and_health_agree_on_weather(client, monkeypatch):
     monkeypatch.setenv("NIMET_API_KEY", "key-without-endpoint")
     monkeypatch.delenv("NIMET_ENDPOINT", raising=False)
-    assert client.get("/api/config").json()["features"]["live_weather"] is False
-    assert client.get("/api/health").json()["integrations"]["nimet"] is False
+    config = client.get("/api/config").json()
+    health = client.get("/api/health").json()
+    # Open-Meteo needs no key, so live weather is always available and must be
+    # reported consistently by both endpoints.
+    assert config["features"]["live_weather"] is True
+    assert config["features"]["weather_provider"].startswith("Open-Meteo")
+    assert health["integrations"]["open_meteo"] is True
+    # NiMet is a separate integration that needs both a key and an endpoint.
+    assert health["integrations"]["nimet"] is False

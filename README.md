@@ -63,7 +63,15 @@ python scripts/fetch_inec_polling_units.py --states Lagos --limit 50 --out data/
 python scripts/fetch_inec_polling_units.py --out data/polling_units.inec.csv --rate 12 --workers 6
 ```
 
-It is cached under `.cache/inec` (reruns are nearly free), throttled to `--rate` requests per second, and appends to the output file so an interrupted run resumes where it stopped. Expect several hours for all 176,846 units. Only run it with INEC's permission; it sets a browser User-Agent because the site's CDN rejects default Python clients, but it does not bypass any authentication.
+It is cached under `.cache/inec` (reruns are nearly free), throttled to `--rate` requests per second, and appends to the output file so an interrupted run resumes where it stopped. A unit whose coordinate lookup fails is still written, with a blank latitude/longitude, and recorded in `data/polling_units.inec.failed.csv`; one flaky request never aborts the run. Expect several hours for all 176,846 units. Only run it with INEC's permission; it sets a browser User-Agent because the site's CDN rejects default Python clients, but it does not bypass any authentication.
+
+If a run was interrupted or INEC returned an address instead of a map pin, fill the blanks in place:
+
+```sh
+python scripts/fetch_inec_polling_units.py --fix-missing --out data/polling_units.inec.csv --rate 10 --workers 5
+```
+
+`--fix-missing` re-walks the directory, updates only rows whose coordinates are blank, and rewrites the CSV atomically every `--flush-every` updates (default 5000), so it can be stopped and resumed. Units that INEC only has a text address for stay blank; the failed lookup is listed in the `.failed.csv` file.
 
 A nationwide CSV exceeds the admin endpoint's 20 MB upload cap, so import it directly with the same validation and stable ids:
 

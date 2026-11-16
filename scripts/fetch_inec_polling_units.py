@@ -11,8 +11,14 @@ It is deliberately polite and restartable:
 * every successful response is cached under ``--cache`` (reruns are free),
 * requests are throttled to ``--rate`` per second across all workers,
 * transient failures are retried with exponential backoff,
+* a single failed polling unit is written to ``<out>.failed.csv`` instead of
+  aborting the whole run,
 * rows are appended to the output CSV, so an interrupted run resumes where it
   stopped.
+
+``--fix-missing`` re-walks the directory and fills in coordinates for rows that
+are already in the CSV but have a blank latitude/longitude. It rewrites the CSV
+atomically every ``--flush-every`` updates, so it is resumable too.
 
 The output columns match POST /api/admin/import-polling-units.
 
@@ -74,7 +80,7 @@ STATE_NAME_OVERRIDES = {"FCT": "Federal Capital Territory"}
 
 
 class Client:
-    def __init__(self, cache_dir: Path, rate: float, retries: int = 8) -> None:
+    def __init__(self, cache_dir: Path, rate: float, retries: int = 6) -> None:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.min_interval = 1.0 / rate if rate > 0 else 0.0
@@ -134,30 +140,35 @@ class Client:
                 url, data=body, headers=headers, method=method
             )
             try:
-                with self._opener().open(request, timeout=30) as response:
-                    status, headers = response.status, dict(response.headers)
+                with self._opener().open(request, timeout=45) as response:
+                    status, response_headers = response.status, dict(response.headers)
                     text = response.read().decode("utf-8", "replace")
             except urllib.error.HTTPError as exc:
-                status, headers = exc.code, dict(exc.headers or {})
+                status, response_headers = exc.code, dict(exc.headers or {})
                 text = exc.read().decode("utf-8", "replace")
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
-                time.sleep(min(2**attempt, 60))
+                time.sleep(min(2**attempt, 30))
                 continue
 
             self.requests += 1
             if status in (200, 302):
-                payload = {"status": status, "headers": headers, "body": text}
+                payload = {
+                    "status": status,
+                    "headers": response_headers,
+                    "body": text,
+                }
                 tmp = path.with_suffix(".tmp")
                 with tmp.open("w", encoding="utf-8") as fh:
                     json.dump(payload, fh)
                 os.replace(tmp, path)
-                return status, headers, text
+                return status, response_headers, text
             if status == 403:
+                # Respect an explicit access-control refusal: do not hammer it.
                 raise RuntimeError(f"HTTP 403 for {url}")
-            if status in (403, 429, 500, 502, 503, 504):
+            if status in (429, 500, 502, 503, 504):
                 last_error = RuntimeError(f"HTTP {status} for {url}")
-                time.sleep(min(2**attempt, 60))
+                time.sleep(min(2**attempt, 30))
                 continue
             raise RuntimeError(f"HTTP {status} for {url}: {text[:200]}")
 
@@ -265,8 +276,29 @@ def coordinates(
 def load_done(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    with path.open(newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return {row["code"] for row in csv.DictReader(fh) if row.get("code")}
+
+
+def load_csv(path: Path) -> tuple[list[str], list[dict]]:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if not fieldnames:
+        raise RuntimeError(f"{path} has no header row")
+    return fieldnames, rows
+
+
+def write_csv_atomic(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh, fieldnames=fieldnames, extrasaction="ignore", restval=""
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, path)
 
 
 def verify_mapping(client: Client) -> None:
@@ -283,6 +315,92 @@ def verify_mapping(client: Client) -> None:
             "State id mapping looks wrong: internal 15 did not return FCT (Abaji). "
             "Re-check how states() reads the dropdown."
         )
+
+
+def iter_ward_units(client: Client, selected, record_failure):
+    """Yield ((context...), units) for every ward.
+
+    Transient errors are recorded and skipped; two consecutive HTTP 403s or a
+    long run of transport failures stop the crawl rather than hammering INEC.
+    """
+    consecutive_errors = 0
+    consecutive_forbidden = 0
+
+    def failed(state_name, lga_name, ward_name, code, exc):
+        nonlocal consecutive_errors, consecutive_forbidden
+        record_failure(state_name, lga_name, ward_name, code, exc)
+        if "HTTP 403" in str(exc):
+            consecutive_forbidden += 1
+            if consecutive_forbidden >= 2:
+                raise RuntimeError(
+                    "Two consecutive HTTP 403 responses; stopping to respect "
+                    "INEC's access controls"
+                ) from exc
+        else:
+            consecutive_forbidden = 0
+            consecutive_errors += 1
+            if consecutive_errors >= 12:
+                raise RuntimeError(
+                    f"12 consecutive request failures; stopping. Last: {exc}"
+                ) from exc
+
+    def succeeded():
+        nonlocal consecutive_errors, consecutive_forbidden
+        consecutive_errors = 0
+        consecutive_forbidden = 0
+
+    for internal, official, state_name in selected:
+        try:
+            state_lgas = lgas(client, internal)
+        except RuntimeError as exc:
+            failed(state_name, "", "", "", exc)
+            continue
+        succeeded()
+        print(f"[{state_name}] {len(state_lgas)} LGAs", file=sys.stderr)
+        for lga_id, lga_label in state_lgas:
+            lga_num, lga_name = strip_prefix(lga_label)
+            if not lga_num:
+                print(f"  skipping LGA without code: {lga_label}", file=sys.stderr)
+                continue
+            lga_name = tidy(lga_name)
+            try:
+                state_wards = wards(client, lga_id)
+            except RuntimeError as exc:
+                failed(state_name, lga_name, "", "", exc)
+                print(
+                    f"  {state_name}/{lga_name}: ward list failed; recorded and skipped",
+                    file=sys.stderr,
+                )
+                continue
+            succeeded()
+            for ward_id, ward_label in state_wards:
+                ward_num, ward_name = strip_prefix(ward_label)
+                if not ward_num:
+                    print(f"  skipping ward without code: {ward_label}", file=sys.stderr)
+                    continue
+                ward_name = tidy(ward_name)
+                try:
+                    units = polling_units(client, ward_id)
+                except RuntimeError as exc:
+                    failed(state_name, lga_name, ward_name, "", exc)
+                    print(
+                        f"  {state_name}/{lga_name}/{ward_name}: polling-unit list "
+                        "failed; recorded and skipped",
+                        file=sys.stderr,
+                    )
+                    continue
+                succeeded()
+                yield (
+                    internal,
+                    official,
+                    state_name,
+                    lga_id,
+                    lga_num,
+                    lga_name,
+                    ward_id,
+                    ward_num,
+                    ward_name,
+                ), units
 
 
 def main() -> int:
@@ -307,9 +425,24 @@ def main() -> int:
         help="enumerate units without fetching coordinates",
     )
     parser.add_argument(
+        "--fix-missing",
+        action="store_true",
+        help="fill blank coordinates in an existing --out CSV instead of appending",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=5000,
+        help="with --fix-missing, rewrite the CSV after this many updates (default 5000)",
+    )
+    parser.add_argument(
         "--verified-at", default=date.today().isoformat(), help="CSV verified_at value"
     )
     args = parser.parse_args()
+
+    if args.fix_missing and args.dry_run:
+        print("--fix-missing and --dry-run cannot be combined", file=sys.stderr)
+        return 2
 
     client = Client(Path(args.cache), args.rate)
     out = Path(args.out)
@@ -318,7 +451,9 @@ def main() -> int:
     all_states = states(client)
     verify_mapping(client)
     if args.states:
-        wanted = {part.strip().casefold() for part in args.states.split(",") if part.strip()}
+        wanted = {
+            part.strip().casefold() for part in args.states.split(",") if part.strip()
+        }
         selected = [
             (internal, official, name)
             for internal, official, name in all_states
@@ -329,6 +464,158 @@ def main() -> int:
             return 2
     else:
         selected = all_states
+
+    failures_path = out.with_name(f"{out.stem}.failed.csv")
+    with failures_path.open("w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerow(["state", "lga", "ward", "code", "error"])
+
+    def record_failure(state_name, lga_name, ward_name, code, error):
+        with failures_path.open("a", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerow(
+                [state_name, lga_name, ward_name, code, str(error)]
+            )
+
+    started = time.monotonic()
+
+    if args.fix_missing:
+        if not out.exists():
+            print(f"{out} does not exist; run without --fix-missing first", file=sys.stderr)
+            return 2
+        fieldnames, rows = load_csv(out)
+        by_code = {row["code"]: row for row in rows if row.get("code")}
+        blank_codes = {
+            code
+            for code, row in by_code.items()
+            if not row.get("latitude") or not row.get("longitude")
+        }
+        print(
+            f"{out}: {len(rows)} rows, {len(blank_codes)} without coordinates",
+            file=sys.stderr,
+        )
+        if not blank_codes:
+            print("Nothing to fix.", file=sys.stderr)
+            return 0
+
+        known_states = {name for _, _, name in all_states}
+        blank_states = {
+            row["state"]
+            for row in rows
+            if not row.get("latitude") or not row.get("longitude")
+        }
+        unknown = blank_states - known_states
+        if unknown:
+            print(
+                f"warning: CSV has state names the locator did not return "
+                f"({sorted(unknown)}); scanning every state",
+                file=sys.stderr,
+            )
+        else:
+            selected = [entry for entry in selected if entry[2] in blank_states]
+            print(
+                f"Scanning {len(selected)} state(s) with missing coordinates",
+                file=sys.stderr,
+            )
+
+        updated = 0
+        pending = 0
+        consecutive_coord_errors = 0
+
+        def flush() -> None:
+            nonlocal pending
+            if not pending:
+                return
+            write_csv_atomic(out, fieldnames, rows)
+            print(f"  flushed {updated} coordinate updates to {out}", file=sys.stderr)
+            pending = 0
+
+        def process(task):
+            (internal, official, state_name, lga_id, lga_num, lga_name, ward_id,
+             ward_num, ward_name, pu_id, pu_label) = task
+            pu_num, pu_name = strip_prefix(pu_label)
+            if not pu_num:
+                return None
+            code = (
+                f"{official:02d}/{int(lga_num):02d}/{int(ward_num):02d}/"
+                f"{int(pu_num):03d}"
+            )
+            if code not in blank_codes:
+                return None
+            try:
+                lat, lon = coordinates(client, internal, lga_id, ward_id, pu_id)
+            except Exception as exc:  # one bad unit must not kill the run
+                return ("failed", code, state_name, lga_name, ward_name, exc)
+            if not lat or not lon:
+                return (
+                    "failed",
+                    code,
+                    state_name,
+                    lga_name,
+                    ward_name,
+                    "no coordinates returned",
+                )
+            return ("update", code, lat, lon)
+
+        for context, units in iter_ward_units(client, selected, record_failure):
+            (internal, official, state_name, lga_id, lga_num, lga_name, ward_id,
+             ward_num, ward_name) = context
+            tasks = [
+                (internal, official, state_name, lga_id, lga_num, lga_name,
+                 ward_id, ward_num, ward_name, pu_id, pu_label)
+                for pu_id, pu_label in units
+            ]
+            if not tasks:
+                continue
+            ward_filled = 0
+            with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
+                for result in pool.map(process, tasks):
+                    if result is None:
+                        continue
+                    kind = result[0]
+                    if kind == "failed":
+                        _, code, state_name, lga_name, ward_name, exc = result
+                        if str(exc) == "no coordinates returned":
+                            consecutive_coord_errors = 0
+                        else:
+                            consecutive_coord_errors += 1
+                        record_failure(state_name, lga_name, ward_name, code, exc)
+                        if consecutive_coord_errors >= 20:
+                            raise RuntimeError(
+                                "20 consecutive coordinate failures; stopping. "
+                                f"Last: {exc}"
+                            )
+                        continue
+                    consecutive_coord_errors = 0
+                    _, code, lat, lon = result
+                    row = by_code[code]
+                    row["latitude"] = lat
+                    row["longitude"] = lon
+                    row["verified_at"] = args.verified_at
+                    blank_codes.discard(code)
+                    updated += 1
+                    pending += 1
+                    ward_filled += 1
+                    if pending >= args.flush_every:
+                        flush()
+                    if args.limit and updated >= args.limit:
+                        break
+            elapsed = time.monotonic() - started
+            rate = updated / elapsed if elapsed else 0
+            print(
+                f"  {state_name}/{lga_name}/{ward_name}: {ward_filled} filled, "
+                f"{updated} total ({rate:.1f}/s, {client.requests} requests, "
+                f"{client.cache_hits} cached)",
+                file=sys.stderr,
+            )
+            if args.limit and updated >= args.limit:
+                break
+
+        flush()
+        print(
+            f"Filled {updated} coordinates; {len(blank_codes)} still missing. "
+            f"Failures: {failures_path}",
+            file=sys.stderr,
+        )
+        return 0
 
     done = load_done(out)
     new_file = not out.exists()
@@ -341,20 +628,8 @@ def main() -> int:
 
     total_written = 0
     skipped = 0
-    consecutive_forbidden = 0
-    started = time.monotonic()
-    failures_path = out.with_name(f"{out.stem}.failed.csv")
-
-    def record_forbidden(state_name, lga_name, ward_name, area_id, exc):
-        if not failures_path.exists():
-            with failures_path.open("w", newline="", encoding="utf-8") as failures:
-                csv.writer(failures).writerow(
-                    ["state", "lga", "ward", "registration_area_id", "error"]
-                )
-        with failures_path.open("a", newline="", encoding="utf-8") as failures:
-            csv.writer(failures).writerow(
-                [state_name, lga_name, ward_name, area_id, str(exc)]
-            )
+    failed = 0
+    consecutive_coord_errors = 0
 
     def process(task):
         (internal, official, state_name, lga_id, lga_num, lga_name, ward_id,
@@ -362,102 +637,96 @@ def main() -> int:
         pu_num, pu_name = strip_prefix(pu_label)
         if not pu_num:
             return None
-        code = f"{official:02d}/{int(lga_num):02d}/{int(ward_num):02d}/{int(pu_num):03d}"
+        code = (
+            f"{official:02d}/{int(lga_num):02d}/{int(ward_num):02d}/"
+            f"{int(pu_num):03d}"
+        )
         if code in done:
-            return "skip"
-        lat, lon = ("", "")
+            return ("skip", code, None, None)
+        lat, lon, error = "", "", None
         if not args.dry_run:
-            lat, lon = coordinates(client, internal, lga_id, ward_id, pu_id)
-        return [state_name, lga_name, ward_name, tidy(pu_name), code, lat, lon,
-                "unknown", SOURCE, LOCATOR, args.verified_at]
-
-    for internal, official, state_name in selected:
-        state_lgas = lgas(client, internal)
-        print(f"[{state_name}] {len(state_lgas)} LGAs", file=sys.stderr)
-        for lga_id, lga_label in state_lgas:
-            lga_num, lga_name = strip_prefix(lga_label)
-            if not lga_num:
-                print(f"  skipping LGA without code: {lga_label}", file=sys.stderr)
-                continue
-            lga_name = tidy(lga_name)
             try:
-                state_wards = wards(client, lga_id)
-                consecutive_forbidden = 0
-            except RuntimeError as exc:
-                if "HTTP 403" not in str(exc):
-                    raise
-                record_forbidden(state_name, lga_name, "", lga_id, exc)
-                consecutive_forbidden += 1
-                print(
-                    f"  {state_name}/{lga_name}: ward list HTTP 403; recorded in {failures_path} and skipped",
-                    file=sys.stderr,
-                )
-                if consecutive_forbidden >= 2:
-                    raise RuntimeError(
-                        "Two consecutive HTTP 403 responses; stopping to respect INEC’s access controls"
-                    ) from exc
-                continue
-            for ward_id, ward_label in state_wards:
-                ward_num, ward_name = strip_prefix(ward_label)
-                if not ward_num:
-                    print(f"  skipping ward without code: {ward_label}", file=sys.stderr)
-                    continue
-                ward_name = tidy(ward_name)
-                try:
-                    units = polling_units(client, ward_id)
-                    consecutive_forbidden = 0
-                except RuntimeError as exc:
-                    if "HTTP 403" not in str(exc):
-                        raise
-                    record_forbidden(state_name, lga_name, ward_name, ward_id, exc)
-                    consecutive_forbidden += 1
-                    print(f"  {state_name}/{lga_name}/{ward_name}: HTTP 403; recorded in {failures_path} and skipped", file=sys.stderr)
-                    if consecutive_forbidden >= 2:
-                        raise RuntimeError("Two consecutive HTTP 403 responses; stopping to respect INEC’s access controls") from exc
-                    continue
-                if args.limit:
-                    remaining = args.limit - total_written
-                    if remaining <= 0:
-                        break
-                    units = units[:remaining]
-                tasks = [
-                    (internal, official, state_name, lga_id, lga_num, lga_name,
-                     ward_id, ward_num, ward_name, pu_id, pu_label)
-                    for pu_id, pu_label in units
-                ]
-                if not tasks:
-                    continue
-                with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
-                    for row in pool.map(process, tasks):
-                        if row is None:
-                            continue
-                        if row == "skip":
-                            skipped += 1
-                            continue
-                        with write_lock:
-                            writer.writerow(row)
-                            handle.flush()
-                            total_written += 1
-                elapsed = time.monotonic() - started
-                rate = total_written / elapsed if elapsed else 0
-                print(
-                    f"  {state_name}/{lga_name}/{ward_name}: {total_written} units "
-                    f"({rate:.1f}/s, {client.requests} requests, "
-                    f"{client.cache_hits} cached)",
-                    file=sys.stderr,
-                )
-                if args.limit and total_written >= args.limit:
-                    break
-            if args.limit and total_written >= args.limit:
+                lat, lon = coordinates(client, internal, lga_id, ward_id, pu_id)
+                if not lat or not lon:
+                    error = "no coordinates returned"
+            except Exception as exc:  # keep the unit even if its pin failed
+                error = exc
+        row = [
+            state_name,
+            lga_name,
+            ward_name,
+            tidy(pu_name),
+            code,
+            lat,
+            lon,
+            "unknown",
+            SOURCE,
+            LOCATOR,
+            args.verified_at,
+        ]
+        return ("row", code, row, error)
+
+    for context, units in iter_ward_units(client, selected, record_failure):
+        (internal, official, state_name, lga_id, lga_num, lga_name, ward_id,
+         ward_num, ward_name) = context
+        if args.limit:
+            remaining = args.limit - total_written
+            if remaining <= 0:
                 break
+            units = units[:remaining]
+        tasks = [
+            (internal, official, state_name, lga_id, lga_num, lga_name,
+             ward_id, ward_num, ward_name, pu_id, pu_label)
+            for pu_id, pu_label in units
+        ]
+        if not tasks:
+            continue
+        ward_written = 0
+        with concurrent.futures.ThreadPoolExecutor(args.workers) as pool:
+            for result in pool.map(process, tasks):
+                if result is None:
+                    continue
+                kind, code, row, error = result
+                if kind == "skip":
+                    skipped += 1
+                    continue
+                with write_lock:
+                    writer.writerow(row)
+                    handle.flush()
+                    total_written += 1
+                    ward_written += 1
+                if error is None:
+                    consecutive_coord_errors = 0
+                elif str(error) == "no coordinates returned":
+                    consecutive_coord_errors = 0
+                    failed += 1
+                    record_failure(state_name, lga_name, ward_name, code, error)
+                else:
+                    consecutive_coord_errors += 1
+                    failed += 1
+                    record_failure(state_name, lga_name, ward_name, code, error)
+                    if consecutive_coord_errors >= 20:
+                        raise RuntimeError(
+                            "20 consecutive coordinate failures; stopping. "
+                            f"Last: {error}"
+                        )
+        elapsed = time.monotonic() - started
+        rate = total_written / elapsed if elapsed else 0
+        print(
+            f"  {state_name}/{lga_name}/{ward_name}: {ward_written} written, "
+            f"{total_written} total ({rate:.1f}/s, {client.requests} requests, "
+            f"{client.cache_hits} cached)",
+            file=sys.stderr,
+        )
         if args.limit and total_written >= args.limit:
             break
 
     handle.close()
     print(
         f"Wrote {total_written} rows to {out} "
-        f"({skipped} already present, {client.requests} live requests, "
-        f"{client.cache_hits} cached)",
+        f"({skipped} already present, {failed} without coordinates, "
+        f"{client.requests} live requests, {client.cache_hits} cached). "
+        f"Failures: {failures_path}",
         file=sys.stderr,
     )
     return 0

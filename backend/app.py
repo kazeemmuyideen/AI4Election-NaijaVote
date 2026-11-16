@@ -31,7 +31,6 @@ SOURCES = {
     "INEC": "https://www.inecnigeria.org/voters/education",
     "INEC polling unit locator": INEC_URL,
     "INEC accessibility guidance": "https://www.inecnigeria.org/",
-    "NiMet": "https://nimet.gov.ng/weatherapi.php",
     "NIHSA": "https://nihsa.gov.ng/",
 }
 
@@ -115,7 +114,7 @@ FAQ: list[dict[str, Any]] = [
     {"id":"priority", "keywords":["priority","elderly","old","pregnant","nursing","breastfeeding","queue"], "question":"Who can receive priority access?", "answer":"INEC’s election guidelines provide priority access for persons with disabilities, visibly pregnant women, nursing or breastfeeding mothers, and elderly voters. Ask an official at your polling unit for the priority queue and confirm current procedures with INEC.", "source":"INEC election guidelines", "source_url":"https://www.inecnigeria.org/elections/guidelines", "language":"en"},
     {"id":"disability", "keywords":["disability","disabled","pwd","wheelchair","blind","accessibility","assistance"], "question":"Can I get assistance to vote?", "answer":"Voters with disabilities can request assistance at the polling unit. Ask an INEC official about the current procedure and available accessibility arrangements for your location.", "source":"INEC", "source_url":SOURCES["INEC"], "language":"en"},
     {"id":"locate", "keywords":["polling unit","where vote","location","find my","ward","lga"], "question":"How do I find my polling unit?", "answer":"This service has polling-unit records from INEC’s public locator for all 36 states and the FCT, though some individual areas may not have locally loaded unit details. Confirm your assigned unit with INEC’s official locator and the details on your PVC.", "source":"INEC polling unit locator", "source_url":INEC_URL, "language":"en"},
-    {"id":"weather", "keywords":["weather","flood","rain","heat","route","safe"], "question":"How should I plan around weather?", "answer":"Check current alerts from NiMet and NIHSA before travelling, then follow local emergency guidance. This service does not have a live forecast feed or verified polling-unit route data connected yet.", "source":"NiMet", "source_url":SOURCES["NiMet"], "language":"en"},
+    {"id":"weather", "keywords":["weather","flood","rain","heat","route","safe"], "question":"How should I plan around weather?", "answer":"Use the Open-Meteo forecast shown here as a planning aid; it is a third-party forecast, not an official NiMet forecast. Hazard advisories appear only when current verified reports are loaded. No report does not mean the area is hazard-free. Check official alerts and follow local emergency guidance.", "source":"Open-Meteo forecast", "source_url":"https://open-meteo.com/", "language":"en"},
 ]
 
 @contextmanager
@@ -166,7 +165,13 @@ def init_db() -> None:
         );
         """)
         for item in FAQ:
-            con.execute("INSERT OR IGNORE INTO knowledge VALUES(?,?,?,?,?,?,?,?)", (item['id'],item['question'],item['answer'],item['language'],json.dumps(item['keywords']),item['source'],item['source_url'],"2026-11-09"))
+            con.execute(
+                "INSERT INTO knowledge VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET question=excluded.question, answer=excluded.answer, "
+                "language=excluded.language, keywords=excluded.keywords, source=excluded.source, "
+                "source_url=excluded.source_url, verified_at=excluded.verified_at",
+                (item['id'],item['question'],item['answer'],item['language'],json.dumps(item['keywords']),item['source'],item['source_url'],datetime.now(timezone.utc).date().isoformat()),
+            )
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -427,7 +432,8 @@ def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: 
     with db() as con: rows=con.execute(f"SELECT * FROM hazard_reports WHERE {' AND '.join(clauses)}",(*args,)).fetchall()
     alerts=[dict(r) for r in rows if _is_active(r['expires_at'], r['observed_at'])]
     score=max((r['severity'] for r in alerts),default=None)
-    return {"state":state,"risk_score":score,"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","alerts":alerts,"source_status":"connected" if alerts else "no verified local alerts","note":"Risk scores reflect only current imported official alerts; no alert does not mean no hazard.","sources":[{"title":"NiMet weather API","url":SOURCES['NiMet']},{"title":"NIHSA flood information","url":SOURCES['NIHSA']}]}
+    sources=sorted({(alert['source'],alert['source_url']) for alert in alerts})
+    return {"state":state,"risk_score":score,"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","alerts":alerts,"source_status":"connected" if alerts else "no verified local alerts","note":"Risk scores reflect only current imported official alerts; no alert does not mean no hazard.","sources":[{"title":title,"url":url} for title,url in sources]}
 
 def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius=6371.0
