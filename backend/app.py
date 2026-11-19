@@ -1,15 +1,18 @@
 """NaijaVote civic API. Data is only shown as authoritative when its source is recorded."""
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import hmac
+import io
 import json
 import math
 import os
 import re
 import sqlite3
 import threading
+import tempfile
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -39,9 +42,23 @@ DECLINE_ANSWER = (
     "Please check INEC’s official voter education information or contact an INEC office."
 )
 
+# Curation date of the FAQ answer set below, sourced from the cited INEC /
+# Open-Meteo pages. It must stay fixed: using "today" on each boot falsely
+# presents an unchanged answer as freshly verified. Update it only when the
+# answers are actually re-reviewed.
+FAQ_VERIFIED_AT = "2026-11-09"
+
 ASK_RATE_LIMIT = int(os.getenv("ASK_RATE_LIMIT_PER_MINUTE", "60"))
-_RATE_LOCK = threading.Lock()
-_RATE_BUCKETS: dict[str, list[float]] = {}
+WEBHOOK_RATE_LIMIT = int(os.getenv("WEBHOOK_RATE_LIMIT_PER_MINUTE", "120"))
+WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "65536"))
+
+# Knowledge rows and HTTP connections are process-wide resources: reloading and
+# re-parsing every answer for each question, or renegotiating TLS for each
+# weather call, is wasteful on the low-bandwidth deployments this service targets.
+_KNOWLEDGE_LOCK = threading.Lock()
+_KNOWLEDGE_CACHE: list[sqlite3.Row] | None = None
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+_HTTP_CLIENT_LOCK = threading.Lock()
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -95,16 +112,55 @@ def _like(value: str) -> str:
 
 
 def _check_rate_limit(request: Request) -> None:
-    if ASK_RATE_LIMIT <= 0:
+    _check_shared_rate_limit(request, "ask", ASK_RATE_LIMIT)
+
+
+def _check_shared_rate_limit(request: Request, endpoint: str, limit: int) -> None:
+    if limit <= 0:
         return
-    now = time.monotonic()
-    key = request.client.host if request.client else "unknown"
-    with _RATE_LOCK:
-        bucket = _RATE_BUCKETS.setdefault(key, [])
-        bucket[:] = [stamp for stamp in bucket if stamp > now - 60]
-        if len(bucket) >= ASK_RATE_LIMIT:
-            raise HTTPException(429, "Too many questions. Please wait a minute and try again.")
-        bucket.append(now)
+    address = request.client.host if request.client else "unknown"
+    client_key = hashlib.sha256(address.encode()).hexdigest()
+    now = time.time()
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM request_rate_limits WHERE requested_at <= ?", (now - 60,))
+        count = con.execute(
+            "SELECT count(*) FROM request_rate_limits WHERE endpoint=? AND client_key=? AND requested_at>?",
+            (endpoint, client_key, now - 60),
+        ).fetchone()[0]
+        if count >= limit:
+            raise HTTPException(429, "Too many requests. Please wait a minute and try again.")
+        con.execute("INSERT INTO request_rate_limits VALUES(?,?,?)", (endpoint, client_key, now))
+
+
+def _knowledge_rows() -> list[sqlite3.Row]:
+    """Return cached knowledge rows, loading them once per process."""
+    global _KNOWLEDGE_CACHE
+    if _KNOWLEDGE_CACHE is None:
+        with _KNOWLEDGE_LOCK:
+            if _KNOWLEDGE_CACHE is None:
+                with db() as con:
+                    _KNOWLEDGE_CACHE = con.execute("SELECT * FROM knowledge").fetchall()
+    return _KNOWLEDGE_CACHE
+
+
+def _invalidate_knowledge_cache() -> None:
+    global _KNOWLEDGE_CACHE
+    with _KNOWLEDGE_LOCK:
+        _KNOWLEDGE_CACHE = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """One pooled client for Open-Meteo, translation and feed calls."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_CLIENT_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.AsyncClient(
+                    timeout=20,
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                )
+    return _HTTP_CLIENT
 
 
 FAQ: list[dict[str, Any]] = [
@@ -142,6 +198,7 @@ def init_db() -> None:
           source_url TEXT NOT NULL, verified_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS pu_search ON polling_units(state, lga, ward);
+        CREATE INDEX IF NOT EXISTS pu_area_lookup ON polling_units(state COLLATE NOCASE, lga COLLATE NOCASE, ward COLLATE NOCASE);
         CREATE TABLE IF NOT EXISTS polling_area_gaps (
           state TEXT NOT NULL, lga TEXT NOT NULL, ward TEXT NOT NULL,
           listed_unit_count INTEGER, source TEXT NOT NULL, source_url TEXT NOT NULL,
@@ -163,6 +220,10 @@ def init_db() -> None:
           language TEXT NOT NULL, keywords TEXT NOT NULL, source TEXT NOT NULL,
           source_url TEXT NOT NULL, verified_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS request_rate_limits (
+          endpoint TEXT NOT NULL, client_key TEXT NOT NULL, requested_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS request_rate_window ON request_rate_limits(endpoint, client_key, requested_at);
         """)
         for item in FAQ:
             con.execute(
@@ -170,15 +231,26 @@ def init_db() -> None:
                 "ON CONFLICT(id) DO UPDATE SET question=excluded.question, answer=excluded.answer, "
                 "language=excluded.language, keywords=excluded.keywords, source=excluded.source, "
                 "source_url=excluded.source_url, verified_at=excluded.verified_at",
-                (item['id'],item['question'],item['answer'],item['language'],json.dumps(item['keywords']),item['source'],item['source_url'],datetime.now(timezone.utc).date().isoformat()),
+                (item['id'],item['question'],item['answer'],item['language'],json.dumps(item['keywords']),item['source'],item['source_url'],FAQ_VERIFIED_AT),
             )
+    _invalidate_knowledge_cache()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _HTTP_CLIENT
     init_db()
-    yield
+    get_http_client()
+    try:
+        yield
+    finally:
+        client, _HTTP_CLIENT = _HTTP_CLIENT, None
+        if client is not None:
+            await client.aclose()
 
-app = FastAPI(title="NaijaVote Navigators API", version="1.1.0", description="Nonpartisan civic information, verified polling units, and source-backed climate risk data.", lifespan=lifespan)
+DOCS_ENABLED = os.getenv("ENABLE_API_DOCS", "true").casefold() in {"1", "true", "yes"}
+app = FastAPI(title="NaijaVote Navigators API", version="1.1.0", description="Nonpartisan civic information, verified polling units, and source-backed climate risk data.", lifespan=lifespan,
+              docs_url="/docs" if DOCS_ENABLED else None, redoc_url="/redoc" if DOCS_ENABLED else None,
+              openapi_url="/openapi.json" if DOCS_ENABLED else None)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","X-Twilio-Signature"])
 
@@ -193,7 +265,11 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(self)")
-    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    else:
+        if "Strict-Transport-Security" in response.headers:
+            del response.headers["Strict-Transport-Security"]
     if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
         response.headers.setdefault("Content-Security-Policy", CSP)
     return response
@@ -314,12 +390,15 @@ def _match(query: str, keywords: list[str]) -> int:
     return score
 
 def _grounded_answer(query: str, language: str = "en") -> dict[str, Any]:
-    with db() as con:
-        rows = con.execute("SELECT * FROM knowledge").fetchall()
+    rows = _knowledge_rows()
 
     def best(candidates: list[sqlite3.Row]) -> tuple[int, sqlite3.Row] | None:
         ranked = sorted(((_match(query, json.loads(row['keywords'])), row) for row in candidates), key=lambda x: x[0], reverse=True)
-        return ranked[0] if ranked and ranked[0][0] > 0 else None
+        if not ranked or ranked[0][0] == 0:
+            return None
+        if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+            return None
+        return ranked[0]
 
     match = best([row for row in rows if row['language'] == language])
     if match is None and language != "en":
@@ -333,7 +412,9 @@ def _grounded_answer(query: str, language: str = "en") -> dict[str, Any]:
 def health():
     with db() as con:
         counts={t:con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("polling_units","hazard_reports","knowledge")}
-    return {"status":"ok","data":counts,"integrations":{"inec_directory":counts['polling_units']>0,"open_meteo":True,"nimet":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"nihsa_feed":bool(os.getenv('NIHSA_FEED_URL')),"llm":bool(os.getenv('LLM_API_KEY')),"whatsapp":bool(os.getenv('TWILIO_AUTH_TOKEN'))}}
+        freshness={"polling_units_verified_at":con.execute("SELECT max(verified_at) FROM polling_units").fetchone()[0],"hazards_observed_at":con.execute("SELECT max(observed_at) FROM hazard_reports").fetchone()[0],"knowledge_verified_at":con.execute("SELECT max(verified_at) FROM knowledge").fetchone()[0]}
+    admin_configured=bool(os.getenv("ADMIN_API_TOKEN") and os.getenv("ADMIN_API_TOKEN")!="replace-with-a-long-random-secret")
+    return {"status":"ok","ready":admin_configured,"data":counts,"freshness":freshness,"integrations":{"inec_directory":counts['polling_units']>0,"open_meteo":True,"nimet":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"nihsa_feed":bool(os.getenv('NIHSA_FEED_URL')),"llm":bool(os.getenv('LLM_API_KEY')),"whatsapp":bool(os.getenv('TWILIO_AUTH_TOKEN'))}}
 
 @app.get("/api/config")
 def config():
@@ -350,8 +431,8 @@ async def ask(payload: AskRequest, request: Request):
             prompt=("Translate the answer below into "+language_names[payload.language]+". Preserve its meaning exactly. Do not add, omit, or infer civic instructions. Return only the translation.\n\n"+result['answer'])
             try:
                 if not endpoint.startswith("https://"): raise ValueError("Translation endpoint must use HTTPS")
-                async with httpx.AsyncClient(timeout=20) as client:
-                    response=await client.post(endpoint,headers={"Authorization":f"Bearer {key}"},json={"model":model,"temperature":0,"messages":[{"role":"user","content":prompt}]}); response.raise_for_status()
+                response=await get_http_client().post(endpoint,headers={"Authorization":f"Bearer {key}"},json={"model":model,"temperature":0,"messages":[{"role":"user","content":prompt}]})
+                response.raise_for_status()
                 translated=response.json()["choices"][0]["message"]["content"].strip()
                 if translated: result['answer']=translated; result['language']=payload.language
                 else: raise ValueError("empty translation")
@@ -365,8 +446,8 @@ async def ask(payload: AskRequest, request: Request):
 
 @app.get("/api/polling-units")
 def polling_units(
-    state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = "",
-    q: str = "", limit: int = Query(default=20, ge=1, le=500),
+    state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100), ward: str = Query(default="", max_length=100),
+    q: str = Query(default="", max_length=300), limit: int = Query(default=20, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
     state=state.strip()
@@ -417,8 +498,9 @@ def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: st
             ).fetchall()
             return {"state":state,"lga":lga,"areas":[row[0] for row in rows]}
         rows=con.execute(
-            "SELECT DISTINCT lga FROM polling_units WHERE state=? COLLATE NOCASE ORDER BY lga",
-            (state,),
+            "SELECT lga FROM polling_units WHERE state=? COLLATE NOCASE "
+            "UNION SELECT lga FROM polling_area_gaps WHERE state=? COLLATE NOCASE ORDER BY lga",
+            (state,state),
         ).fetchall()
     return {"state":state,"areas":[row[0] for row in rows]}
 
@@ -434,6 +516,15 @@ def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: 
     score=max((r['severity'] for r in alerts),default=None)
     sources=sorted({(alert['source'],alert['source_url']) for alert in alerts})
     return {"state":state,"risk_score":score,"risk_level":("high" if score>=70 else "moderate" if score>=35 else "low") if score is not None else "unknown","alerts":alerts,"source_status":"connected" if alerts else "no verified local alerts","note":"Risk scores reflect only current imported official alerts; no alert does not mean no hazard.","sources":[{"title":title,"url":url} for title,url in sources]}
+
+def _proximity_radius() -> float:
+    """A misconfigured radius must degrade to the documented default, not a 500."""
+    try:
+        radius = float(os.getenv("RISK_PROXIMITY_KM", "10"))
+    except (TypeError, ValueError):
+        return 10.0
+    return radius if math.isfinite(radius) and radius >= 0 else 10.0
+
 
 def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius=6371.0
@@ -451,7 +542,7 @@ def unit_risk(unit_id: str):
         if unit['latitude'] is None or unit['longitude'] is None:
             return {"polling_unit":unit['name'],"risk_level":"unknown","risk_score":None,"alerts":[],"note":"This polling unit has no verified coordinates in the local register."}
         hazards=con.execute("SELECT * FROM hazard_reports WHERE state LIKE ? ESCAPE '\\' AND latitude IS NOT NULL AND longitude IS NOT NULL",(f"%{_like(unit['state'])}%",)).fetchall()
-    radius=float(os.getenv("RISK_PROXIMITY_KM","10"))
+    radius=_proximity_radius()
     nearby=[]
     for hazard in hazards:
         if not _is_active(hazard['expires_at'], hazard['observed_at']):
@@ -493,14 +584,13 @@ async def weather(state: str):
         raise HTTPException(404,"Weather is available for Nigerian states and the FCT only")
     latitude,longitude,city=location
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            response=await client.get("https://api.open-meteo.com/v1/forecast",params={
-                "latitude":latitude,"longitude":longitude,
-                "current":"temperature_2m,precipitation,weather_code",
-                "daily":"temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
-                "forecast_days":3,"timezone":"Africa/Lagos",
-            })
-            response.raise_for_status(); data=response.json()
+        response=await get_http_client().get("https://api.open-meteo.com/v1/forecast",timeout=12,params={
+            "latitude":latitude,"longitude":longitude,
+            "current":"temperature_2m,precipitation,weather_code",
+            "daily":"temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
+            "forecast_days":3,"timezone":"Africa/Lagos",
+        })
+        response.raise_for_status(); data=response.json()
         return {"available":True,"provider":"Open-Meteo","official":False,
                 "location":city,"state":state,"data":data,
                 "source":"https://open-meteo.com/","attribution":"Third-party forecast only; official weather and emergency alerts are separate.",
@@ -529,13 +619,12 @@ async def polling_unit_weather(unit_id: str):
         location=f"{capital} (state-capital estimate)"
         location_note="This polling-unit record has no coordinates; showing state-capital conditions."
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            response=await client.get("https://api.open-meteo.com/v1/forecast",params={
-                "latitude":latitude,"longitude":longitude,
-                "current":"temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
-                "timezone":"Africa/Lagos",
-            })
-            response.raise_for_status(); data=response.json()
+        response=await get_http_client().get("https://api.open-meteo.com/v1/forecast",timeout=12,params={
+            "latitude":latitude,"longitude":longitude,
+            "current":"temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
+            "timezone":"Africa/Lagos",
+        })
+        response.raise_for_status(); data=response.json()
         return {"available":True,"provider":"Open-Meteo","location":location,
                 "location_note":location_note,"current":data.get("current",{}),
                 "retrieved_at":datetime.now(timezone.utc).isoformat(),
@@ -578,23 +667,40 @@ def add_hazard(payload: HazardUpload):
 
 @app.post("/api/admin/import-polling-units", dependencies=[Depends(require_admin)])
 async def import_units(request: Request):
-    body=await request.body()
-    if len(body)>20_000_000: raise HTTPException(413,"CSV exceeds 20 MB")
+    body_parts=[]
+    body_size=0
+    async for part in request.stream():
+        body_size+=len(part)
+        if body_size>20_000_000: raise HTTPException(413,"CSV exceeds 20 MB")
+        body_parts.append(part)
+    body=b"".join(body_parts)
 
     def _import() -> int:
         try:
-            reader=csv.DictReader(body.decode("utf-8-sig").splitlines())
+            reader=csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
             needed={"state","lga","ward","name","code","source","source_url","verified_at"}
             if not needed.issubset(set(reader.fieldnames or [])): raise ValueError(f"Required CSV columns: {', '.join(sorted(needed))}")
-            items=[]
-            for row in reader:
-                for key in ("latitude","longitude","accessibility"):
-                    if row.get(key)=="": row[key]=None if key!="accessibility" else "unknown"
-                items.append(_unit_row(UnitUpload(**row)))
+            with tempfile.TemporaryFile(mode="w+t",encoding="utf-8") as staged:
+                count=0
+                for row in reader:
+                    for key in ("latitude","longitude","accessibility"):
+                        if row.get(key)=="": row[key]=None if key!="accessibility" else "unknown"
+                    staged.write(json.dumps(_unit_row(UnitUpload(**row)),ensure_ascii=False)+"\n")
+                    count+=1
+                staged.seek(0)
+                with db() as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    batch=[]
+                    for line in staged:
+                        batch.append(tuple(json.loads(line)))
+                        if len(batch)>=2000:
+                            con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",batch)
+                            batch.clear()
+                    if batch:
+                        con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",batch)
         except (UnicodeDecodeError,ValueError,TypeError) as exc:
             raise HTTPException(400,str(exc)) from exc
-        with db() as con: con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",items)
-        return len(items)
+        return count
 
     return {"imported": await run_in_threadpool(_import)}
 
@@ -602,17 +708,24 @@ async def import_units(request: Request):
 def add_knowledge(payload: KnowledgeUpload):
     with db() as con:
         con.execute("INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?,?,?,?,?)",(payload.id,payload.question,payload.answer,payload.language,json.dumps([x.casefold() for x in payload.keywords]),payload.source,payload.source_url,payload.verified_at))
+    _invalidate_knowledge_cache()
     return {"id":payload.id,"status":"saved"}
 
 @app.post("/api/webhooks/whatsapp")
 async def whatsapp(request: Request):
-    form=await request.form()
+    _check_shared_rate_limit(request,"whatsapp",WEBHOOK_RATE_LIMIT)
+    form_body=bytearray()
+    async for part in request.stream():
+        form_body.extend(part)
+        if len(form_body)>WEBHOOK_MAX_BODY_BYTES: raise HTTPException(413,"Webhook body is too large")
+    from urllib.parse import parse_qs
+    form={key:values[-1] for key,values in parse_qs(form_body.decode("utf-8", "replace"),keep_blank_values=True).items()}
     token=os.getenv("TWILIO_AUTH_TOKEN")
     signature=request.headers.get("X-Twilio-Signature", "")
     if not token: raise HTTPException(503,"WhatsApp webhook is not configured")
     signed=os.getenv("TWILIO_WEBHOOK_URL",str(request.url))
     signed+= ''.join(key+str(form.get(key,"")) for key in sorted(form.keys()))
-    expected=__import__('base64').b64encode(hmac.new(token.encode(),signed.encode(),hashlib.sha1).digest()).decode()
+    expected=base64.b64encode(hmac.new(token.encode(),signed.encode(),hashlib.sha1).digest()).decode()
     if not hmac.compare_digest(signature,expected): raise HTTPException(403,"Invalid provider signature")
     incoming=str(form.get("Body", "")).strip()
     if not incoming: return Response(content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Please send a civic question. For official information, visit inecnigeria.org.</Message></Response>",media_type="application/xml")
@@ -630,8 +743,8 @@ async def sync_nihsa():
     headers={}
     if os.getenv("NIHSA_API_TOKEN"): headers["Authorization"]=f"Bearer {os.getenv('NIHSA_API_TOKEN')}"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response=await client.get(feed,headers=headers); response.raise_for_status(); data=response.json()
+        response=await get_http_client().get(feed,timeout=30,headers=headers)
+        response.raise_for_status(); data=response.json()
         if not isinstance(data,list): raise ValueError("Expected a JSON array of normalized hazard reports")
         items=[]
         for raw in data:

@@ -47,6 +47,8 @@ def test_health_and_index(client):
     health = client.get("/api/health")
     assert health.status_code == 200
     assert health.json()["data"]["knowledge"] >= 7
+    assert health.json()["freshness"]["knowledge_verified_at"]
+    assert health.json()["ready"] is True
     assert client.get("/index.html").status_code == 200
 
 
@@ -54,6 +56,7 @@ def test_security_headers(client):
     response = client.get("/")
     assert response.headers["x-content-type-options"] == "nosniff"
     assert "content-security-policy" in response.headers
+    assert "strict-transport-security" not in response.headers
 
 
 def test_ask_returns_cited_answer(client):
@@ -136,6 +139,13 @@ def test_import_and_search_polling_unit(client):
     assert any(unit["code"] == "LA/01/04/002" for unit in found["results"])
 
 
+def test_polling_unit_areas_lists_lgas_and_accepts_state_case(client):
+    assert client.post("/api/admin/polling-units", headers=ADMIN, json=_unit(code="AREA/TEST/001")).status_code == 200
+    response = client.get("/api/polling-unit-areas", params={"state":"lagos"})
+    assert response.status_code == 200
+    assert "Ikeja" in response.json()["areas"]
+
+
 def test_like_wildcards_are_escaped(client):
     assert client.post("/api/admin/polling-units", headers=ADMIN, json=_unit(code="LA/01/04/999")).status_code == 200
     found = client.get("/api/polling-units", params={"state": "%"}).json()
@@ -166,12 +176,97 @@ def test_ask_is_rate_limited(client, monkeypatch):
     import backend.app as app_module
 
     monkeypatch.setattr(app_module, "ASK_RATE_LIMIT", 2)
-    app_module._RATE_BUCKETS.clear()
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint='ask'")
     payload = {"question": "What do I need to bring to vote?", "language": "en"}
     assert client.post("/api/ask", json=payload).status_code == 200
     assert client.post("/api/ask", json=payload).status_code == 200
     assert client.post("/api/ask", json=payload).status_code == 429
-    app_module._RATE_BUCKETS.clear()
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint='ask'")
+
+
+def test_ambiguous_answer_is_declined(client):
+    response = client.post(
+        "/api/admin/knowledge", headers=ADMIN,
+        json={"id":"ambiguous-vote","question":"How do I vote?","answer":"Different answer","language":"en","keywords":["vote"],"source":"INEC","source_url":"https://www.inecnigeria.org/","verified_at":"2026-11-09"},
+    )
+    assert response.status_code == 200
+    answer = client.post("/api/ask", json={"question":"vote","language":"en"}).json()
+    assert answer["confidence"] == "low"
+
+
+def test_polling_units_pagination(client):
+    from backend.app import UnitUpload, _unit_row, db
+
+    rows = [_unit_row(UnitUpload(**_unit(code=f"PAGE/{index:03d}", name=f"Page Unit {index:03d}"))) for index in range(3)]
+    with db() as con:
+        con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    first = client.get("/api/polling-units", params={"state":"Lagos","lga":"Ikeja","ward":"Ward 04","limit":2,"offset":0}).json()
+    second = client.get("/api/polling-units", params={"state":"Lagos","lga":"Ikeja","ward":"Ward 04","limit":2,"offset":2}).json()
+    assert first["total_count"] >= 3
+    assert len(first["results"]) == 2
+    assert len(second["results"]) >= 1
+
+
+def test_whatsapp_body_limit(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setattr(app_module, "WEBHOOK_MAX_BODY_BYTES", 1)
+    response = client.post("/api/webhooks/whatsapp", content="Body=hello")
+    assert response.status_code == 413
+
+
+def test_knowledge_cache_is_invalidated_after_admin_write(client):
+    probe = "cacheprobeonly"
+    before = client.post("/api/ask", json={"question": probe}).json()
+    assert before["confidence"] == "low"
+
+    response = client.post(
+        "/api/admin/knowledge",
+        headers=ADMIN,
+        json={
+            "id": "cache-probe",
+            "question": "Cache probe question?",
+            "answer": "CACHE PROBE ANSWER",
+            "language": "en",
+            "keywords": [probe],
+            "source": "INEC",
+            "source_url": "https://www.inecnigeria.org/",
+            "verified_at": "2026-11-09",
+        },
+    )
+    assert response.status_code == 200
+    assert client.post("/api/ask", json={"question": probe}).json()["answer"] == "CACHE PROBE ANSWER"
+
+
+def test_seeded_answer_verified_at_is_stable(client):
+    import backend.app as app_module
+
+    question = "What do I need to bring to vote?"
+    first = client.post("/api/ask", json={"question": question}).json()["citations"][0]["verified_at"]
+    app_module.init_db()
+    second = client.post("/api/ask", json={"question": question}).json()["citations"][0]["verified_at"]
+    assert first == second == app_module.FAQ_VERIFIED_AT
+
+
+def test_invalid_proximity_radius_uses_default(client, monkeypatch):
+    from backend.app import UnitUpload, _unit_row
+
+    unit_payload = _unit(code="RADIUS/TEST/001")
+    unit_id = _unit_row(UnitUpload(**unit_payload))[0]
+    assert client.post("/api/admin/polling-units", headers=ADMIN, json=unit_payload).status_code == 200
+
+    monkeypatch.setenv("RISK_PROXIMITY_KM", "not-a-number")
+    response = client.get(f"/api/polling-units/{unit_id}/risk")
+    assert response.status_code == 200
+    assert response.json()["proximity_radius_km"] == 10.0
+
+
+def test_http_client_is_pooled(client):
+    import backend.app as app_module
+
+    assert app_module.get_http_client() is app_module.get_http_client()
 
 
 def test_config_and_health_agree_on_weather(client, monkeypatch):

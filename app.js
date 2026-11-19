@@ -6,6 +6,13 @@ const translations = {
   yo: {ask:'Béèrè ìbéèrè',find:'Wa ibùdó ìdìbò rẹ',day:'Ọjọ́ ìdìbò',start:'Béèrè ìbéèrè',lookup:'Wa ibùdó ìdìbò mi',welcome:'Ẹ káàbọ̀! Mo lè ràn yín lọ́wọ́ láti lóye ìdìbò àti ẹ̀tọ́ yín. Kí ni ẹ fẹ́ mọ̀?',placeholder:'Tẹ ìbéèrè rẹ síbí…'}
 };
 const INEC_EDUCATION='https://www.inecnigeria.org/voters/education';
+const API_TIMEOUT_MS=15000;
+// Bound every API wait so a stalled connection shows the sourced fallback
+// instead of leaving the interface spinning indefinitely on slow mobile data.
+function apiFetch(url,options={}){
+  const signal=typeof AbortSignal.timeout==='function'?AbortSignal.timeout(API_TIMEOUT_MS):undefined;
+  return fetch(url,{...options,...(signal?{signal}:{})});
+}
 const stateSelect=document.querySelector('#state');
 const nigeriaStates=['Abia','Adamawa','Akwa Ibom','Anambra','Bauchi','Bayelsa','Benue','Borno','Cross River','Delta','Ebonyi','Edo','Ekiti','Enugu','Federal Capital Territory','Gombe','Imo','Jigawa','Kaduna','Kano','Katsina','Kebbi','Kogi','Kwara','Lagos','Nasarawa','Niger','Ogun','Ondo','Osun','Oyo','Plateau','Rivers','Sokoto','Taraba','Yobe','Zamfara'];
 const stateOptions='<option value="">Select a state</option>'+nigeriaStates.map(s=>`<option>${s}</option>`).join('');
@@ -77,7 +84,7 @@ async function answerQuestion(question){
   }
   addMessage(question,'user-message');
   try{
-    const response=await fetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:lang.value})});
+    const response=await apiFetch('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,language:lang.value})});
     if(!response.ok)throw new Error('API unavailable');
     addAnswer(await response.json());
   }catch{
@@ -88,6 +95,8 @@ async function answerQuestion(question){
 document.querySelector('#chat-form').addEventListener('submit',e=>{e.preventDefault();const input=document.querySelector('#question');const q=input.value.trim();if(!q)return;answerQuestion(q);input.value='';});
 document.querySelectorAll('.suggestion').forEach(button=>button.addEventListener('click',()=>answerQuestion(button.dataset.question)));
 let activePollingSearch=null;
+const POLLING_PAGE_SIZE=100;
+let pollingOffset=0;
 const lgaSelect=document.querySelector('#lga');
 const wardSelect=document.querySelector('#ward');
 const lookupSubmit=document.querySelector('#lookup-submit');
@@ -98,7 +107,7 @@ function resetSelect(select,placeholder){
 async function loadPollingAreas(state,lga=''){
   const params=new URLSearchParams({state});
   if(lga)params.set('lga',lga);
-  const response=await fetch(`/api/polling-unit-areas?${params}`);
+  const response=await apiFetch(`/api/polling-unit-areas?${params}`);
   if(!response.ok)throw new Error('Area list unavailable');
   return (await response.json()).areas||[];
 }
@@ -132,17 +141,22 @@ document.querySelector('#lookup-form').addEventListener('submit',async e=>{
   const lga=lgaSelect.value,ward=wardSelect.value;
   if(!state||!lga||!ward)return;
   activePollingSearch={state,lga,ward};
+  pollingOffset=0;
   await loadPollingUnits();
 });
 async function loadPollingUnits(){
   const {state,lga,ward}=activePollingSearch;
   const result=document.querySelector('#lookup-result');
-  result.textContent='Searching verified local records…';
+  if(pollingOffset===0)result.textContent='Searching verified local records…';
+  else{
+    const more=result.querySelector('.load-more-units');
+    if(more){more.disabled=true;more.textContent='Loading…';}
+  }
   try{
-    const params=new URLSearchParams({state,lga,ward,limit:'500'});
+    const params=new URLSearchParams({state,limit:String(POLLING_PAGE_SIZE),offset:String(pollingOffset)});
     if(lga)params.set('lga',lga);
     if(ward)params.set('ward',ward);
-    const response=await fetch(`/api/polling-units?${params}`);
+    const response=await apiFetch(`/api/polling-units?${params}`);
     if(!response.ok)throw new Error('Lookup unavailable');
     const data=await response.json();
     if(data.results?.length){
@@ -170,7 +184,7 @@ async function loadPollingUnits(){
           weatherResult.hidden=false;
           weatherResult.textContent='Checking current weather…';
           try{
-            const response=await fetch(`/api/polling-units/${encodeURIComponent(unit.id)}/weather`);
+            const response=await apiFetch(`/api/polling-units/${encodeURIComponent(unit.id)}/weather`);
             const currentWeather=await response.json();
             if(!response.ok||!currentWeather.available)throw new Error('Weather unavailable');
             const current=currentWeather.current||{};
@@ -211,7 +225,7 @@ async function loadPollingUnits(){
             riskButton.disabled=true;
             riskButton.textContent='Checking…';
             try{
-              const r=await fetch(`/api/polling-units/${encodeURIComponent(unit.id)}/risk`);
+              const r=await apiFetch(`/api/polling-units/${encodeURIComponent(unit.id)}/risk`);
               if(!r.ok)throw new Error('Risk unavailable');
               const risk=await r.json();
               riskButton.textContent=risk.risk_level==='unknown'?'Risk unknown':`${risk.risk_level} risk${risk.risk_score===null?'':` · ${risk.risk_score}/100`}`;
@@ -230,15 +244,30 @@ async function loadPollingUnits(){
       }
       const summary=document.createElement('p');
       summary.className='polling-count';
-      summary.textContent=data.total_count===1?'1 polling unit in this ward':`${data.total_count} polling units in this ward`;
-      if(data.total_count>data.count)summary.textContent+=` (first ${data.count} shown)`;
-      cards.unshift(summary);
-      result.replaceChildren(...cards);
+      summary.textContent=`Showing 1–${pollingOffset+data.count} of ${data.total_count} polling units`;
+      if(pollingOffset===0)result.replaceChildren(summary,...cards);
+      else{
+        result.querySelector('.polling-count')?.replaceWith(summary);
+        result.querySelector('.load-more-units')?.remove();
+        result.append(...cards);
+      }
+      if(pollingOffset+data.count<data.total_count){
+        const more=document.createElement('button');
+        more.type='button';more.className='load-more-units';more.textContent='Load more polling units';
+        more.addEventListener('click',()=>{pollingOffset+=data.count;loadPollingUnits();});
+        result.append(more);
+      }
     }else{
       result.textContent=data.notice||'No matching verified record found. Check your PVC or INEC’s official locator.';
     }
   }catch{
-    result.textContent='Local lookup service is unavailable. Use INEC’s official polling-unit locator below.';
+    if(pollingOffset===0)result.textContent='Local lookup service is unavailable. Use INEC’s official polling-unit locator below.';
+    else{
+      const error=document.createElement('p');
+      error.textContent='More local records could not be loaded. Please try again.';
+      result.querySelector('.load-more-units')?.remove();
+      result.append(error);
+    }
   }
 }
 function weatherCondition(code){
@@ -270,8 +299,8 @@ document.querySelector('#check-alerts').addEventListener('click',async()=>{
   output.textContent='Checking current advisories…';
   try{
     const [riskResult,weatherResult]=await Promise.allSettled([
-      fetch(`/api/risk?state=${encodeURIComponent(state)}`),
-      fetch(`/api/weather/${encodeURIComponent(state)}`)
+      apiFetch(`/api/risk?state=${encodeURIComponent(state)}`),
+      apiFetch(`/api/weather/${encodeURIComponent(state)}`)
     ]);
     const riskResponse=riskResult.status==='fulfilled'?riskResult.value:null;
     const weatherResponse=weatherResult.status==='fulfilled'?weatherResult.value:null;

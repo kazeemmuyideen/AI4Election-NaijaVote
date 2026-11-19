@@ -28,3 +28,8 @@ footer{font-size:10px}
 .ward-weather-result{margin:5px 0 0;padding:8px;background:#f2f6ed;border-radius:4px;color:#405047;font-size:10px;line-height:1.5}
 .polling-count{margin:8px 0;color:#526458;font-size:10px}
 .unit-directions{width:max-content;color:#397250;font:600 10px 'DM Sans',Arial,sans-serif;text-underline-offset:2px}
+.load-more-units{border:1px solid #397250;border-radius:999px;background:#fff;padding:10px 16px;color:#275b3d;font:600 13px 'DM Sans',Arial,sans-serif;cursor:pointer}
+.load-more-units:focus-visible{outline:3px solid #9a5a18;outline-offset:3px}
+#lookup-result{max-height:22rem;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;padding:0 10px 8px}
+#lookup-result .polling-count{position:sticky;top:0;z-index:1;background:#fff;padding:9px 0}
+@media(max-width:700px){#lookup-result{max-height:18rem}}

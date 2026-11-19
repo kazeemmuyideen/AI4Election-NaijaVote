@@ -20,6 +20,8 @@ import argparse
 import csv
 import os
 import sys
+import json
+import tempfile
 from pathlib import Path
 
 REQUIRED = {"state", "lga", "ward", "name", "code", "source", "source_url", "verified_at"}
@@ -35,6 +37,8 @@ def main() -> int:
     )
     parser.add_argument("--batch", type=int, default=2000)
     args = parser.parse_args()
+    if args.batch < 1:
+        parser.error("--batch must be at least 1")
 
     # backend.app resolves DB_PATH at import time, so set it first.
     os.environ["DATABASE_PATH"] = str(Path(args.db).resolve())
@@ -43,45 +47,55 @@ def main() -> int:
 
     init_db()
 
-    rows: list[tuple] = []
     errors: list[str] = []
     rejected = 0
-    for file in args.files:
-        with open(file, newline="", encoding="utf-8-sig") as fh:
-            reader = csv.DictReader(fh)
-            missing = REQUIRED - set(reader.fieldnames or [])
-            if missing:
-                print(f"{file}: missing columns {', '.join(sorted(missing))}", file=sys.stderr)
-                return 2
-            for line, raw in enumerate(reader, start=2):
-                for key in ("latitude", "longitude"):
-                    if raw.get(key) in ("", None):
-                        raw[key] = None
-                if raw.get("accessibility") in ("", None):
-                    raw["accessibility"] = "unknown"
-                try:
-                    rows.append(_unit_row(UnitUpload(**raw)))
-                except Exception as exc:  # pydantic ValidationError and friends
-                    rejected += 1
-                    if len(errors) < 10:
-                        errors.append(f"{file}:{line} ({raw.get('code')}): {exc}")
+    imported = 0
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as staged:
+        for file in args.files:
+            with open(file, newline="", encoding="utf-8-sig") as fh:
+                reader = csv.DictReader(fh)
+                missing = REQUIRED - set(reader.fieldnames or [])
+                if missing:
+                    print(f"{file}: missing columns {', '.join(sorted(missing))}", file=sys.stderr)
+                    return 2
+                for line, raw in enumerate(reader, start=2):
+                    for key in ("latitude", "longitude"):
+                        if raw.get(key) in ("", None):
+                            raw[key] = None
+                    if raw.get("accessibility") in ("", None):
+                        raw["accessibility"] = "unknown"
+                    try:
+                        row = _unit_row(UnitUpload(**raw))
+                        staged.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        imported += 1
+                    except Exception as exc:  # pydantic ValidationError and friends
+                        rejected += 1
+                        if len(errors) < 10:
+                            errors.append(f"{file}:{line} ({raw.get('code')}): {exc}")
 
-    if rejected:
-        print(f"Rejected {rejected} row(s); nothing imported:", file=sys.stderr)
-        for error in errors:
-            print(f"  {error}", file=sys.stderr)
-        return 1
+        if rejected:
+            print(f"Rejected {rejected} row(s); nothing imported:", file=sys.stderr)
+            for error in errors:
+                print(f"  {error}", file=sys.stderr)
+            return 1
 
-    for start in range(0, len(rows), args.batch):
+        # Stage validated records on disk, then write bounded batches under a
+        # single transaction so nationwide CSVs use constant importer memory.
+        staged.seek(0)
         with db() as con:
-            con.executemany(
-                "INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                rows[start : start + args.batch],
-            )
+            con.execute("BEGIN IMMEDIATE")
+            batch_rows = []
+            for line in staged:
+                batch_rows.append(tuple(json.loads(line)))
+                if len(batch_rows) >= args.batch:
+                    con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", batch_rows)
+                    batch_rows.clear()
+            if batch_rows:
+                con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", batch_rows)
 
     with db() as con:
         total = con.execute("SELECT count(*) FROM polling_units").fetchone()[0]
-    print(f"Imported {len(rows)} rows into {os.environ['DATABASE_PATH']} — polling_units now {total}")
+    print(f"Imported {imported} rows into {os.environ['DATABASE_PATH']} — polling_units now {total}")
     return 0
 
 

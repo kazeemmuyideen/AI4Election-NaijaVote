@@ -2,6 +2,17 @@
 
 An accessible, nonpartisan civic information service for Nigerian voters. The repository contains a low-bandwidth PWA frontend and a FastAPI backend for cited civic answers, verified polling-unit search, imported hazard advisories, and optional provider integrations.
 
+## Project layout
+
+| Path | Role |
+| --- | --- |
+| `index.html`, `styles.css`, `app.js`, `sw.js` | Low-bandwidth installable PWA: sourced Q&A chat, polling-unit lookup, weather/alerts, offline shell |
+| `backend/app.py` | FastAPI service: health/config, Q&A, polling units, risk/weather, protected admin imports, Twilio webhook |
+| `scripts/fetch_inec_polling_units.py` | Resumable, cached crawl of INEC's public polling-unit locator into importable CSV |
+| `scripts/import_polling_units.py` | Validated bulk CSV import into SQLite (bypasses the API's 20 MB upload cap) |
+| `tests/` | Pytest suite covering retrieval, validation, auth, expiry, rate limits and data integrity |
+| `data/` | Local SQLite database, example CSV, and imported/failed INEC extracts |
+
 ## Run locally
 
 Requires Python 3.11 or newer.
@@ -24,19 +35,22 @@ python -m pytest
 
 Open `http://localhost:8000`. API documentation is at `/docs`; health and data-source status are at `/api/health`. SQLite is created automatically under `data/` by default. Set `DATABASE_PATH` to move it to a persistent volume.
 
-For a container run, use the included `Dockerfile` and `docker-compose.yml` or pass environment variables through your deployment secret manager, and mount a persistent volume at `/app/data`. Do not expose `/docs` or admin endpoints without the production access controls provided by your gateway.
+For a container run, use the included `Dockerfile` and `docker-compose.yml` or pass environment variables through your deployment secret manager, and mount a persistent volume at `/app/data`. Set `ENABLE_API_DOCS=false` in production unless a gateway restricts `/docs`, `/redoc`, and `/openapi.json`. Admin routes still require a private `ADMIN_API_TOKEN`; protect them at the gateway as well.
 
 ## Current behavior and source guarantees
 
-- Civic answers use a small, curated retrieval set. Keyword matching is whole-word/phrase based, answers stored in the requested language are preferred, and the API declines questions with no verified match. This is not a comprehensive, continuously synchronized INEC knowledge base.
+- Civic answers use a small, curated retrieval set. Keyword matching is whole-word/phrase based, answers stored in the requested language are preferred, and the API declines questions with no verified match. This is not a comprehensive, continuously synchronized INEC knowledge base. The `verified_at` on seeded answers is the fixed date the answer set was curated (`FAQ_VERIFIED_AT`), not a fresh verification on each server start; re-review the answers and update that constant when the source guidance changes.
 - English source answers can optionally be translated by an OpenAI-compatible chat-completions endpoint when `LLM_API_KEY` is configured. Translation is constrained to the retrieved answer; the original source citation is retained. Without a translation provider, the UI explicitly displays English rather than inventing legal/electoral translations. A question in a language with no matching local answer still falls back to English retrieval before declining.
 - The language selector currently translates only selected navigation and chat prompts; most page content remains English. Review translations with native civic and legal reviewers before relying on them for public election services.
-- Polling units are returned only from the local, source-attributed register. No fictitious locations are seeded. If a search has no data, the UI links to INEC's [official polling-unit locator](https://cvr.inecnigeria.org/pu).
+- Polling units are returned only from the local, source-attributed register. No fictitious locations are seeded. If a search has no data, the UI links to INEC's [official polling-unit locator](https://cvr.inecnigeria.org/pu). Only units whose INEC map link resolved have coordinates; in the bundled extract (November 2026) that is about 14,400 of 175,000 units. The rest still appear in search, but use state-capital weather estimates and address-based map links.
 - Risk scores come only from current imported hazard reports. “Unknown” means there is no verified report in the local store; it does not mean safe. Imported scores are not a route-safety guarantee.
 - Polling-unit proximity checks require coordinates on both the unit and alert, and use the configurable `RISK_PROXIMITY_KM` radius (10 km by default). This is a proximity alert, not floodplain intersection or a dry-route calculation.
 - Weather forecasts use Open-Meteo without an API key. They are third-party model forecasts for the state capital, not official NiMet forecasts or warnings. The endpoint returns a three-day forecast with retrieval time and attribution. Open-Meteo free access is for non-commercial use and requires attribution; check its current terms before deployment.
 - NIHSA feed synchronization accepts an authorized feed normalized to the documented JSON shape below. The official NIHSA website publishes seasonal outlooks and bulletins; these are distinct from live emergency alerts. Public NIHSA information remains linked even when no authorized feed is configured.
 - Browser speech recognition and speech synthesis depend on the visitor's browser and available voice/language packs.
+- Polling-unit results are paginated in batches of 100; use “Load more” to continue through a large ward. `/api/polling-units` supports `limit` and `offset` for other clients.
+- Rate limits are stored in SQLite, with hashed client addresses, and are shared by workers that use the same database file. If running behind a reverse proxy, configure Uvicorn's trusted `FORWARDED_ALLOW_IPS` to the proxy addresses only; do not trust forwarded headers from arbitrary clients. A managed PostgreSQL/Redis limiter is recommended when scaling beyond the single-host SQLite deployment.
+- `/api/health` includes the newest local verification/observation dates and a `ready` flag that is false if the admin token is unset or still the example placeholder. These dates describe stored data; they do not independently certify its accuracy or freshness.
 
 ## Polling-unit data import
 
@@ -71,7 +85,11 @@ If a run was interrupted or INEC returned an address instead of a map pin, fill 
 python scripts/fetch_inec_polling_units.py --fix-missing --out data/polling_units.inec.csv --rate 10 --workers 5
 ```
 
-`--fix-missing` re-walks the directory, updates only rows whose coordinates are blank, and rewrites the CSV atomically every `--flush-every` updates (default 5000), so it can be stopped and resumed. Units that INEC only has a text address for stay blank; the failed lookup is listed in the `.failed.csv` file.
+`--fix-missing` re-walks the directory, updates only rows whose coordinates are blank, and rewrites the CSV atomically every `--flush-every` updates (default 5000), so it can be stopped and resumed. Units that INEC only has a text address for stay blank; the failed lookup is listed in the `.failed.csv` file. The API reads only the database, so **re-run the importer after fixing the CSV** or the corrected coordinates will not appear in searches, maps, weather or proximity alerts:
+
+```sh
+python scripts/import_polling_units.py --db data/naijavote.db data/polling_units.inec.csv
+```
 
 A nationwide CSV exceeds the admin endpoint's 20 MB upload cap, so import it directly with the same validation and stable ids:
 
@@ -109,7 +127,7 @@ An optional `NIHSA_FEED_URL` can be synchronized with `POST /api/admin/sync-nihs
 
 ## Environment settings
 
-See [.env.example](.env.example). Required for data administration: `ADMIN_API_TOKEN`. Optional integrations: `NIMET_API_KEY` + `NIMET_ENDPOINT`, `NIHSA_FEED_URL` + `NIHSA_API_TOKEN`, and `LLM_API_KEY` with optional `LLM_BASE_URL` and `LLM_MODEL`. `ASK_RATE_LIMIT_PER_MINUTE` caps `/api/ask` per client (default 60; set to 0 to disable). Twilio inbound webhooks require `TWILIO_AUTH_TOKEN`; set `TWILIO_WEBHOOK_URL` to the exact public HTTPS callback URL when running behind a proxy, register it with Twilio, and enable WhatsApp in your account. Do not commit `.env` or provider credentials.
+See [.env.example](.env.example). Required for data administration: `ADMIN_API_TOKEN`. Optional integrations: `NIMET_API_KEY` + `NIMET_ENDPOINT`, `NIHSA_FEED_URL` + `NIHSA_API_TOKEN`, and `LLM_API_KEY` with optional `LLM_BASE_URL` and `LLM_MODEL`. `ASK_RATE_LIMIT_PER_MINUTE` caps `/api/ask` per client (default 60; set to 0 to disable). WhatsApp webhooks are limited by `WEBHOOK_RATE_LIMIT_PER_MINUTE` (default 120) and `WEBHOOK_MAX_BODY_BYTES` (default 65536). `ENABLE_API_DOCS` controls the interactive docs and should be false in production unless the gateway protects them. Twilio inbound webhooks require `TWILIO_AUTH_TOKEN`; set `TWILIO_WEBHOOK_URL` to the exact public HTTPS callback URL when running behind a proxy, register it with Twilio, and enable WhatsApp in your account. Do not commit `.env` or provider credentials. Rate limits use SQLite, so all workers must share the same database file; trust forwarded client headers only from known proxies.
 
 ## Production completion checklist
 
