@@ -64,13 +64,17 @@ function addAnswer(result){
   node.append(document.createTextNode(result.answer));
   if(result.notice){const note=document.createElement('p');note.lang='en';note.textContent=result.notice;node.append(note);}
   for(const source of result.citations||[]){
-    const link=document.createElement('a');
-    link.href=source.url;
-    link.target='_blank';
-    link.rel='noopener noreferrer';
-    link.lang='en';
-    link.textContent=`Source: ${source.title} ↗`;
-    node.append(link);
+    try{
+      const url=new URL(source.url, location.origin);
+      if(url.protocol!=='https:')continue;
+      const link=document.createElement('a');
+      link.href=url.href;
+      link.target='_blank';
+      link.rel='noopener noreferrer';
+      link.lang='en';
+      link.textContent=`Source: ${source.title} ↗`;
+      node.append(link);
+    }catch{}
   }
   node.append(speakButton(result.answer));
   chat.append(node);
@@ -210,9 +214,12 @@ async function loadPollingUnits(){
         directions.textContent=unit.latitude!==null&&unit.longitude!==null?'Get directions ↗':'Find on map (approximate) ↗';
         directions.setAttribute('aria-label',`${unit.latitude!==null&&unit.longitude!==null?'Get directions to':'Find approximate map location for'} ${unit.name}, ${unit.ward}, ${unit.lga}`);
         item.append(directions);
-        if(unit.latitude!==null&&unit.longitude!==null){
+        if(Number.isFinite(unit.latitude)&&Number.isFinite(unit.longitude)){
+          const lat=Number(unit.latitude);
+          const lon=Number(unit.longitude);
           const map=document.createElement('a');
-          map.href=`https://www.openstreetmap.org/?mlat=${unit.latitude}&mlon=${unit.longitude}#map=16/${unit.latitude}/${unit.longitude}`;
+          const mapParams=new URLSearchParams({mlat:String(lat),mlon:String(lon)});
+          map.href=`https://www.openstreetmap.org/?${mapParams}#map=16/${lat}/${lon}`;
           map.target='_blank';
           map.rel='noopener noreferrer';
           map.className='unit-map';

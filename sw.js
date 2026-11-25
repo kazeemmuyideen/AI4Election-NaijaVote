@@ -13,6 +13,11 @@ self.addEventListener('activate',event=>{
   );
 });
 
+const SHELL_PATHS=new Set(SHELL);
+function isStaticAsset(pathname){
+  return SHELL_PATHS.has(pathname)||/\.(?:css|js|svg|png|webmanifest|ico)$/.test(pathname);
+}
+
 self.addEventListener('fetch',event=>{
   const request=event.request;
   if(request.method!=='GET')return;
@@ -21,11 +26,10 @@ self.addEventListener('fetch',event=>{
 
   // Navigations are network-first so a new deployment is picked up, with a cached shell offline.
   if(request.mode==='navigate'){
-    const isShell=url.pathname==='/'||url.pathname==='/index.html';
     event.respondWith(
       fetch(request)
         .then(response=>{
-          if(isShell&&response.ok){
+          if(response.ok&&response.type==='basic'){
             const copy=response.clone();
             caches.open(CACHE).then(cache=>cache.put('/index.html',copy));
           }
@@ -36,12 +40,13 @@ self.addEventListener('fetch',event=>{
     return;
   }
 
-  // Static assets: serve from cache immediately, refresh in the background.
+  // Only cache known same-origin static assets; never cache docs/API/admin responses.
+  if(!isStaticAsset(url.pathname))return;
   event.respondWith(
     caches.match(request).then(cached=>{
       const network=fetch(request)
         .then(response=>{
-          if(response.ok){
+          if(response.ok&&response.type==='basic'){
             const copy=response.clone();
             caches.open(CACHE).then(cache=>cache.put(request,copy));
           }

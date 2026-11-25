@@ -153,9 +153,14 @@ class Client:
 
             self.requests += 1
             if status in (200, 302):
-                payload = {
+                safe_headers = {
+            key: value
+            for key, value in response_headers.items()
+            if key.lower() not in {"set-cookie", "cookie"}
+        }
+        payload = {
                     "status": status,
-                    "headers": response_headers,
+                    "headers": safe_headers,
                     "body": text,
                 }
                 tmp = path.with_suffix(".tmp")

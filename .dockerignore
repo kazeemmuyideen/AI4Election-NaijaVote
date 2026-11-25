@@ -4,5 +4,8 @@
 __pycache__
 *.py[cod]
 data/*.db
+data/*.csv
+!data/polling_units.example.csv
+.cache/
 .pytest_cache
 tests

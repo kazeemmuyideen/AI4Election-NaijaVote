@@ -637,8 +637,13 @@ async def polling_unit_weather(unit_id: str):
 def require_admin(authorization: str = Header(default="")) -> None:
     token=os.getenv("ADMIN_API_TOKEN")
     if not token or token=="replace-with-a-long-random-secret": raise HTTPException(503,"Set a unique ADMIN_API_TOKEN before using admin routes")
-    supplied=authorization[7:] if authorization.startswith("Bearer ") else authorization
-    if not hmac.compare_digest(supplied,token):
+    supplied=authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
+    try:
+        supplied_bytes=supplied.encode("ascii")
+        token_bytes=token.encode("ascii")
+    except UnicodeEncodeError:
+        raise HTTPException(401,"Valid admin bearer token required")
+    if not hmac.compare_digest(supplied_bytes,token_bytes):
         raise HTTPException(401,"Valid admin bearer token required")
 
 def _unit_row(p: UnitUpload) -> tuple:
@@ -726,7 +731,12 @@ async def whatsapp(request: Request):
     signed=os.getenv("TWILIO_WEBHOOK_URL",str(request.url))
     signed+= ''.join(key+str(form.get(key,"")) for key in sorted(form.keys()))
     expected=base64.b64encode(hmac.new(token.encode(),signed.encode(),hashlib.sha1).digest()).decode()
-    if not hmac.compare_digest(signature,expected): raise HTTPException(403,"Invalid provider signature")
+    try:
+        signature_bytes=signature.encode("ascii")
+        expected_bytes=expected.encode("ascii")
+    except UnicodeEncodeError:
+        raise HTTPException(403,"Invalid provider signature")
+    if not hmac.compare_digest(signature_bytes,expected_bytes): raise HTTPException(403,"Invalid provider signature")
     incoming=str(form.get("Body", "")).strip()
     if not incoming: return Response(content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Please send a civic question. For official information, visit inecnigeria.org.</Message></Response>",media_type="application/xml")
     result=await run_in_threadpool(_grounded_answer, incoming, "en")
@@ -757,7 +767,8 @@ async def sync_nihsa():
             with db() as con: con.executemany("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",items)
         await run_in_threadpool(_save)
         return {"imported":len(items),"source":"NIHSA authorized feed"}
-    except (httpx.HTTPError,ValueError,TypeError) as exc: raise HTTPException(502,f"NIHSA feed could not be normalized: {exc}") from exc
+    except (httpx.HTTPError,ValueError,TypeError) as exc:
+        raise HTTPException(502,"NIHSA feed could not be normalized") from exc
 
 @app.get("/", include_in_schema=False)
 @app.get("/index.html", include_in_schema=False)

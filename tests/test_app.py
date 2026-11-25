@@ -100,6 +100,38 @@ def test_admin_auth_runs_before_body_validation(client):
     assert client.post("/api/admin/polling-units", json={}).status_code == 401
 
 
+def test_admin_auth_rejects_non_ascii_header():
+    import asyncio
+    import backend.app as app_module
+
+    async def receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/api/admin/polling-units",
+        "raw_path": b"/api/admin/polling-units",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"authorization", b"Bearer caf\xc3\xa9"),
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    asyncio.run(app_module.app(scope, receive, send))
+    assert messages[0]["status"] == 401
+
+
 def test_import_rejects_non_https_source(client):
     csv = (
         "state,lga,ward,name,code,source,source_url,verified_at\n"
@@ -217,6 +249,41 @@ def test_whatsapp_body_limit(client, monkeypatch):
     assert response.status_code == 413
 
 
+def test_whatsapp_rejects_non_ascii_signature(monkeypatch):
+    import asyncio
+    import backend.app as app_module
+
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-secret")
+    body = b"Body=hello"
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "path": "/api/webhooks/whatsapp",
+        "raw_path": b"/api/webhooks/whatsapp",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/x-www-form-urlencoded"),
+            (b"x-twilio-signature", b"caf\xc3\xa9"),
+        ],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    asyncio.run(app_module.app(scope, receive, send))
+    assert messages[0]["status"] == 403
+
+
 def test_knowledge_cache_is_invalidated_after_admin_write(client):
     probe = "cacheprobeonly"
     before = client.post("/api/ask", json={"question": probe}).json()
@@ -281,3 +348,18 @@ def test_config_and_health_agree_on_weather(client, monkeypatch):
     assert health["integrations"]["open_meteo"] is True
     # NiMet is a separate integration that needs both a key and an endpoint.
     assert health["integrations"]["nimet"] is False
+
+
+def test_sync_nihsa_does_not_leak_exception(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setenv("NIHSA_FEED_URL", "https://nihsa.gov.ng/feed")
+
+    async def boom(*args, **kwargs):
+        raise app_module.httpx.ReadTimeout("secret-upstream-detail", request=None)
+
+    monkeypatch.setattr(app_module.get_http_client(), "get", boom)
+    response = client.post("/api/admin/sync-nihsa", headers=ADMIN)
+    assert response.status_code == 502
+    assert response.json()["detail"] == "NIHSA feed could not be normalized"
+    assert "secret-upstream-detail" not in response.text
