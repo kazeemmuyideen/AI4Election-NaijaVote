@@ -1,4 +1,14 @@
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   naijavote:
     build: .
     ports:
@@ -7,8 +17,14 @@ services:
       - .env
     environment:
       DATABASE_PATH: /app/data/naijavote.db
+      REDIS_URL: redis://redis:6379/0
+      TRUST_PROXY_HEADERS: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes:
       - naijavote-data:/app/data
     restart: unless-stopped
+
 volumes:
   naijavote-data:

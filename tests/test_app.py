@@ -430,6 +430,17 @@ def test_public_read_endpoints_are_rate_limited(client, monkeypatch):
         con.execute("DELETE FROM request_rate_limits WHERE endpoint='public_read'")
 
 
+def test_outbound_allowlist_blocks_unlisted_host(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setenv("NIHSA_FEED_URL", "https://nihsa.gov.ng/feed")
+    monkeypatch.setattr(app_module, "OUTBOUND_ALLOWED_HOSTS", {"api.open-meteo.com"})
+    monkeypatch.setattr(app_module, "_hostname_resolves_public", lambda host: True)
+    response = client.post("/api/admin/sync-nihsa", headers=ADMIN)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "NIHSA_FEED_URL must use a public HTTPS URL"
+
+
 def test_security_headers_on_error_response(client):
     huge = "x" * (2 * 1024 * 1024)
     response = client.post("/api/ask", json={"question": huge, "language": "en"})

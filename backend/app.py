@@ -8,6 +8,7 @@ import hmac
 import io
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -28,6 +29,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
+
+try:
+    import redis as redis_sync  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    redis_sync = None
+
+logger = logging.getLogger("naijavote")
+if not logger.handlers:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(message)s")
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "naijavote.db")))
@@ -66,6 +76,9 @@ WEBHOOK_MAX_BODY_BYTES = _positive_int_env("WEBHOOK_MAX_BODY_BYTES", 65536)
 MAX_REQUEST_BODY_BYTES = _positive_int_env("MAX_REQUEST_BODY_BYTES", 1_048_576)
 MAX_ADMIN_IMPORT_BYTES = _positive_int_env("MAX_ADMIN_IMPORT_BYTES", 20_000_000)
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").casefold() in {"1", "true", "yes"}
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+OUTBOUND_ALLOWED_HOSTS = {h.strip().casefold() for h in os.getenv("OUTBOUND_ALLOWED_HOSTS", "").split(",") if h.strip()}
+AUDIT_LOG_ENABLED = os.getenv("AUDIT_LOG_ENABLED", "true").casefold() in {"1", "true", "yes"}
 
 # Knowledge rows and HTTP connections are process-wide resources: reloading and
 # re-parsing every answer for each question, or renegotiating TLS for each
@@ -74,6 +87,8 @@ _KNOWLEDGE_LOCK = threading.Lock()
 _KNOWLEDGE_CACHE: list[sqlite3.Row] | None = None
 _HTTP_CLIENT: httpx.AsyncClient | None = None
 _HTTP_CLIENT_LOCK = threading.Lock()
+_REDIS_CLIENT = None
+_REDIS_LOCK = threading.Lock()
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -166,11 +181,24 @@ def _https_url(value: str) -> str:
     return value
 
 
+def _host_is_allowlisted(hostname: str) -> bool:
+    host = hostname.casefold().rstrip(".")
+    if not OUTBOUND_ALLOWED_HOSTS:
+        return True
+    for allowed in OUTBOUND_ALLOWED_HOSTS:
+        allowed = allowed.casefold().rstrip(".")
+        if host == allowed or host.endswith("." + allowed):
+            return True
+    return False
+
+
 def _public_https_url(value: str) -> str:
     value = _https_url(value)
     hostname = urlparse(value).hostname or ""
     if _is_private_ip(hostname) or not _hostname_resolves_public(hostname):
         raise ValueError("must be an absolute public HTTPS URL")
+    if not _host_is_allowlisted(hostname):
+        raise ValueError("outbound host is not allowlisted")
     return value
 
 
@@ -212,6 +240,43 @@ async def _read_limited_body(request: Request, limit: int) -> bytes:
     return body
 
 
+def _audit(event: str, request: Request | None = None, **fields: Any) -> None:
+    if not AUDIT_LOG_ENABLED:
+        return
+    payload: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+    }
+    if request is not None:
+        payload["path"] = request.url.path
+        payload["method"] = request.method
+        payload["client"] = _client_address(request)
+    for k, v in fields.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            payload[k] = v
+        else:
+            payload[k] = str(v)
+    logger.info(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _get_redis_client():
+    global _REDIS_CLIENT
+    if not REDIS_URL or redis_sync is None:
+        return None
+    if _REDIS_CLIENT is None:
+        with _REDIS_LOCK:
+            if _REDIS_CLIENT is None:
+                try:
+                    client = redis_sync.Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2, socket_timeout=2)
+                    client.ping()
+                    _REDIS_CLIENT = client
+                    _audit("redis_connected")
+                except Exception as exc:
+                    _audit("redis_unavailable", error=exc.__class__.__name__)
+                    _REDIS_CLIENT = False
+    return _REDIS_CLIENT or None
+
+
 def _check_rate_limit(request: Request) -> None:
     _check_shared_rate_limit(request, "ask", ASK_RATE_LIMIT)
 
@@ -220,16 +285,34 @@ def _check_shared_rate_limit(request: Request, endpoint: str, limit: int) -> Non
     if limit <= 0:
         return
     client_key = hashlib.sha256(_client_address(request).encode()).hexdigest()
-    now = time.time()
+    now = int(time.time())
+    bucket = now - (now % 60)
+    redis_client = _get_redis_client()
+    if redis_client is not None:
+        key = f"rl:{endpoint}:{client_key}:{bucket}"
+        try:
+            count = redis_client.incr(key)
+            if count == 1:
+                redis_client.expire(key, 70)
+            if count > limit:
+                _audit("rate_limited", request, endpoint=endpoint, limit=limit, backend="redis")
+                raise HTTPException(429, "Too many requests. Please wait a minute and try again.")
+            return
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _audit("redis_rate_limit_fallback", request, endpoint=endpoint, error=exc.__class__.__name__)
+    now_f = time.time()
     with db() as con:
-        con.execute("DELETE FROM request_rate_limits WHERE requested_at <= ?", (now - 60,))
+        con.execute("DELETE FROM request_rate_limits WHERE requested_at <= ?", (now_f - 60,))
         count = con.execute(
             "SELECT count(*) FROM request_rate_limits WHERE endpoint=? AND client_key=? AND requested_at>?",
-            (endpoint, client_key, now - 60),
+            (endpoint, client_key, now_f - 60),
         ).fetchone()[0]
         if count >= limit:
+            _audit("rate_limited", request, endpoint=endpoint, limit=limit, backend="sqlite")
             raise HTTPException(429, "Too many requests. Please wait a minute and try again.")
-        con.execute("INSERT INTO request_rate_limits VALUES(?,?,?)", (endpoint, client_key, now))
+        con.execute("INSERT INTO request_rate_limits VALUES(?,?,?)", (endpoint, client_key, now_f))
 
 
 def _knowledge_rows() -> list[sqlite3.Row]:
@@ -796,7 +879,8 @@ async def weather(state: str, request: Request):
         raise HTTPException(404,"Weather is available for Nigerian states and the FCT only")
     latitude,longitude,city=location
     try:
-        response=await get_http_client().get("https://api.open-meteo.com/v1/forecast",timeout=12,params={
+        url = _public_https_url("https://api.open-meteo.com/v1/forecast")
+        response=await get_http_client().get(url,timeout=12,params={
             "latitude":latitude,"longitude":longitude,
             "current":"temperature_2m,precipitation,weather_code",
             "daily":"temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code",
@@ -808,6 +892,7 @@ async def weather(state: str, request: Request):
                 "source":"https://open-meteo.com/","attribution":"Third-party forecast only; official weather and emergency alerts are separate.",
                 "retrieved_at":datetime.now(timezone.utc).isoformat()}
     except (httpx.HTTPError,ValueError) as exc:
+        _audit("upstream_weather_failed", request, error=exc.__class__.__name__)
         return JSONResponse(status_code=502,content={"available":False,"provider":"Open-Meteo",
             "message":"The third-party forecast is temporarily unavailable. Check official weather guidance.",
             "source":"https://open-meteo.com/"})
@@ -832,7 +917,8 @@ async def polling_unit_weather(unit_id: str, request: Request):
         location=f"{capital} (state-capital estimate)"
         location_note="This polling-unit record has no coordinates; showing state-capital conditions."
     try:
-        response=await get_http_client().get("https://api.open-meteo.com/v1/forecast",timeout=12,params={
+        url = _public_https_url("https://api.open-meteo.com/v1/forecast")
+        response=await get_http_client().get(url,timeout=12,params={
             "latitude":latitude,"longitude":longitude,
             "current":"temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m",
             "timezone":"Africa/Lagos",
@@ -842,7 +928,8 @@ async def polling_unit_weather(unit_id: str, request: Request):
                 "location_note":location_note,"current":data.get("current",{}),
                 "retrieved_at":datetime.now(timezone.utc).isoformat(),
                 "source":"https://open-meteo.com/"}
-    except (httpx.HTTPError,ValueError):
+    except (httpx.HTTPError,ValueError) as exc:
+        _audit("upstream_weather_failed", request, error=exc.__class__.__name__)
         return JSONResponse(status_code=502,content={"available":False,"provider":"Open-Meteo",
             "message":"Current weather is temporarily unavailable. Please try again.",
             "source":"https://open-meteo.com/"})
@@ -850,19 +937,23 @@ async def polling_unit_weather(unit_id: str, request: Request):
 def require_admin(request: Request, authorization: str = Header(default="")) -> None:
     token = os.getenv("ADMIN_API_TOKEN")
     if not token or token == "replace-with-a-long-random-secret":
+        _audit("admin_auth_unconfigured", request)
         raise HTTPException(503, "Set a unique ADMIN_API_TOKEN before using admin routes")
     supplied = authorization[7:].strip() if authorization.casefold().startswith("bearer ") else ""
     if not supplied:
         _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        _audit("admin_auth_failed", request)
         raise HTTPException(401, "Valid admin bearer token required")
     try:
         supplied_bytes = supplied.encode("ascii")
         token_bytes = token.encode("ascii")
     except UnicodeEncodeError:
         _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        _audit("admin_auth_failed", request)
         raise HTTPException(401, "Valid admin bearer token required")
     if not hmac.compare_digest(supplied_bytes, token_bytes):
         _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        _audit("admin_auth_failed", request)
         raise HTTPException(401, "Valid admin bearer token required")
     _check_shared_rate_limit(request, "admin", ADMIN_RATE_LIMIT)
 
@@ -877,17 +968,19 @@ def _hazard_row(report: HazardUpload) -> tuple:
     return (uid,report.state,report.lga,report.ward,report.latitude,report.longitude,report.hazard,report.severity,report.details,report.source,report.source_url,report.observed_at,report.expires_at)
 
 @app.post("/api/admin/polling-units", dependencies=[Depends(require_admin)])
-def add_unit(payload: UnitUpload):
+def add_unit(payload: UnitUpload, request: Request):
     row=_unit_row(payload)
     with db() as con:
         con.execute("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",row)
+    _audit("admin_polling_unit_saved", request, unit_id=row[0])
     return {"id":row[0],"status":"saved"}
 
 @app.post("/api/admin/hazards", dependencies=[Depends(require_admin)])
-def add_hazard(payload: HazardUpload):
+def add_hazard(payload: HazardUpload, request: Request):
     row=_hazard_row(payload)
     with db() as con:
         con.execute("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",row)
+    _audit("admin_hazard_saved", request, hazard_id=row[0])
     return {"id":row[0],"status":"saved"}
 
 @app.post("/api/admin/import-polling-units", dependencies=[Depends(require_admin)])
@@ -923,13 +1016,16 @@ async def import_units(request: Request):
             raise HTTPException(400, "Invalid CSV import data") from exc
         return count
 
-    return {"imported": await run_in_threadpool(_import)}
+    imported = await run_in_threadpool(_import)
+    _audit("admin_polling_units_imported", request, imported=imported)
+    return {"imported": imported}
 
 @app.post("/api/admin/knowledge", dependencies=[Depends(require_admin)])
-def add_knowledge(payload: KnowledgeUpload):
+def add_knowledge(payload: KnowledgeUpload, request: Request):
     with db() as con:
         con.execute("INSERT OR REPLACE INTO knowledge VALUES(?,?,?,?,?,?,?,?)",(payload.id,payload.question,payload.answer,payload.language,json.dumps([x.casefold() for x in payload.keywords]),payload.source,payload.source_url,payload.verified_at))
     _invalidate_knowledge_cache()
+    _audit("admin_knowledge_saved", request, knowledge_id=payload.id)
     return {"id":payload.id,"status":"saved"}
 
 @app.post("/api/webhooks/whatsapp")
@@ -984,7 +1080,7 @@ async def whatsapp(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 @app.post("/api/admin/sync-nihsa", dependencies=[Depends(require_admin)])
-async def sync_nihsa():
+async def sync_nihsa(request: Request):
     feed = os.getenv("NIHSA_FEED_URL")
     if not feed:
         raise HTTPException(503, "Configure an authorized NIHSA_FEED_URL first")
@@ -1014,8 +1110,10 @@ async def sync_nihsa():
                 con.executemany("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", items)
 
         await run_in_threadpool(_save)
+        _audit("nihsa_sync_completed", request, imported=len(items))
         return {"imported": len(items), "source": "NIHSA authorized feed"}
     except (httpx.HTTPError, ValueError, TypeError) as exc:
+        _audit("nihsa_sync_failed", request, error=exc.__class__.__name__)
         raise HTTPException(502, "NIHSA feed could not be normalized") from exc
 
 @app.get("/", include_in_schema=False)

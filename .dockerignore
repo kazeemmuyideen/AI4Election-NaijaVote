@@ -17,7 +17,6 @@ data/*.csv
 .coverage
 htmlcov
 tests
-docs
 *.pem
 *.key
 *.crt
