@@ -59,11 +59,13 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 ASK_RATE_LIMIT = _positive_int_env("ASK_RATE_LIMIT_PER_MINUTE", 60)
+PUBLIC_READ_RATE_LIMIT = _positive_int_env("PUBLIC_READ_RATE_LIMIT_PER_MINUTE", 120)
 ADMIN_RATE_LIMIT = _positive_int_env("ADMIN_RATE_LIMIT_PER_MINUTE", 30)
 WEBHOOK_RATE_LIMIT = _positive_int_env("WEBHOOK_RATE_LIMIT_PER_MINUTE", 120)
 WEBHOOK_MAX_BODY_BYTES = _positive_int_env("WEBHOOK_MAX_BODY_BYTES", 65536)
 MAX_REQUEST_BODY_BYTES = _positive_int_env("MAX_REQUEST_BODY_BYTES", 1_048_576)
 MAX_ADMIN_IMPORT_BYTES = _positive_int_env("MAX_ADMIN_IMPORT_BYTES", 20_000_000)
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").casefold() in {"1", "true", "yes"}
 
 # Knowledge rows and HTTP connections are process-wide resources: reloading and
 # re-parsing every answer for each question, or renegotiating TLS for each
@@ -178,20 +180,36 @@ def _like(value: str) -> str:
 
 
 def _client_address(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            candidate = forwarded.split(",")[0].strip()
+            try:
+                ipaddress.ip_address(candidate)
+                return candidate
+            except ValueError:
+                pass
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        if real_ip:
+            try:
+                ipaddress.ip_address(real_ip)
+                return real_ip
+            except ValueError:
+                pass
     if request.client and request.client.host:
         return request.client.host
     return "unknown"
 
 
 async def _read_limited_body(request: Request, limit: int) -> bytes:
+    # request_limits middleware buffers and enforces caps for POST/PUT/PATCH.
+    # This helper remains as a defense-in-depth fallback.
     if limit <= 0:
         raise HTTPException(413, "Request body is too large")
-    body = bytearray()
-    async for part in request.stream():
-        body.extend(part)
-        if len(body) > limit:
-            raise HTTPException(413, "Request body is too large")
-    return bytes(body)
+    body = await request.body()
+    if len(body) > limit:
+        raise HTTPException(413, "Request body is too large")
+    return body
 
 
 def _check_rate_limit(request: Request) -> None:
@@ -238,8 +256,10 @@ def get_http_client() -> httpx.AsyncClient:
         with _HTTP_CLIENT_LOCK:
             if _HTTP_CLIENT is None:
                 _HTTP_CLIENT = httpx.AsyncClient(
-                    timeout=20,
+                    timeout=httpx.Timeout(15.0, connect=5.0),
                     limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                    follow_redirects=False,
+                    headers={"User-Agent": "NaijaVote/1.0 (+https://naijavote.app)"},
                 )
     return _HTTP_CLIENT
 
@@ -346,18 +366,40 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' https://fonts.go
        "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(self)",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+
+def _apply_security_headers(request: Request, response: Response) -> Response:
+    for key, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(key, value)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").casefold() if TRUST_PROXY_HEADERS else ""
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    elif "Strict-Transport-Security" in response.headers:
+        del response.headers["Strict-Transport-Security"]
+    if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
+        response.headers.setdefault("Content-Security-Policy", CSP)
+    return response
+
 
 @app.middleware("http")
 async def request_limits(request: Request, call_next):
     if request.method in {"POST", "PUT", "PATCH"}:
         limit = MAX_ADMIN_IMPORT_BYTES if request.url.path == "/api/admin/import-polling-units" else MAX_REQUEST_BODY_BYTES
         if limit <= 0:
-            return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+            return _apply_security_headers(request, JSONResponse(status_code=413, content={"detail": "Request body is too large"}))
         content_length = request.headers.get("content-length")
         if content_length:
             try:
                 if int(content_length) > limit:
-                    return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+                    return _apply_security_headers(request, JSONResponse(status_code=413, content={"detail": "Request body is too large"}))
             except ValueError:
                 pass
 
@@ -373,7 +415,7 @@ async def request_limits(request: Request, call_next):
             chunk = message.get("body", b"")
             body.extend(chunk)
             if len(body) > limit:
-                return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+                return _apply_security_headers(request, JSONResponse(status_code=413, content={"detail": "Request body is too large"}))
             more_body = message.get("more_body", False)
         else:
             replay_messages = [{"type": "http.request", "body": bytes(body), "more_body": False}]
@@ -389,26 +431,14 @@ async def request_limits(request: Request, call_next):
             return await extra_receive()
 
         request._receive = replay_receive
-    return await call_next(request)
+    response = await call_next(request)
+    return _apply_security_headers(request, response)
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(self)")
-    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
-    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
-    forwarded_proto = request.headers.get("x-forwarded-proto", "").casefold()
-    if request.url.scheme == "https" or forwarded_proto == "https":
-        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    elif "Strict-Transport-Security" in response.headers:
-        del response.headers["Strict-Transport-Security"]
-    if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
-        response.headers.setdefault("Content-Security-Policy", CSP)
-    return response
+    return _apply_security_headers(request, response)
 
 class AskRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -598,7 +628,13 @@ async def ask(payload: AskRequest, request: Request):
                     timeout=15,
                 )
                 response.raise_for_status()
-                translated = response.json()["choices"][0]["message"]["content"].strip()
+                payload_json = response.json()
+                choices = payload_json.get("choices") if isinstance(payload_json, dict) else None
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    raise ValueError("invalid translation response")
+                message = choices[0].get("message")
+                content = message.get("content") if isinstance(message, dict) else None
+                translated = content.strip() if isinstance(content, str) else ""
                 if not translated:
                     raise ValueError("empty translation")
                 result["answer"] = translated
@@ -613,6 +649,7 @@ async def ask(payload: AskRequest, request: Request):
 
 @app.get("/api/polling-units")
 def polling_units(
+    request: Request,
     state: str = Query(min_length=1, max_length=100),
     lga: str = Query(default="", max_length=100),
     ward: str = Query(default="", max_length=100),
@@ -620,6 +657,7 @@ def polling_units(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     state=state.strip()
     if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
@@ -657,7 +695,8 @@ def polling_units(
     return {"results":[dict(r) for r in rows],"count":len(rows),"total_count":total,"limit":limit,"offset":offset,"source":"source-attributed local register","coverage":{"loaded_states":loaded_states,"loaded_state_count":len(loaded_states),"total_states_and_fct":37},"official_locator":INEC_URL,"notice":notice}
 
 @app.get("/api/polling-unit-areas")
-def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100)):
+def polling_unit_areas(request: Request, state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100)):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     state=state.strip()
     with db() as con:
         if lga:
@@ -675,7 +714,8 @@ def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: st
     return {"state":state,"areas":[row[0] for row in rows]}
 
 @app.get("/api/risk")
-def risk(state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100), ward: str = Query(default="", max_length=100)):
+def risk(request: Request, state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100), ward: str = Query(default="", max_length=100)):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     state=state.strip()
     if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
@@ -705,7 +745,8 @@ def distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return radius*2*math.atan2(math.sqrt(a),math.sqrt(1-a))
 
 @app.get("/api/polling-units/{unit_id}/risk")
-def unit_risk(unit_id: str):
+def unit_risk(unit_id: str, request: Request):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     with db() as con:
         unit=con.execute("SELECT * FROM polling_units WHERE id=?",(unit_id,)).fetchone()
         if not unit: raise HTTPException(404,"Polling unit not found in verified local data")
@@ -748,7 +789,8 @@ WEATHER_LOCATIONS = {
 }
 
 @app.get("/api/weather/{state}")
-async def weather(state: str):
+async def weather(state: str, request: Request):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     location=WEATHER_LOCATIONS.get(state.strip().casefold())
     if not location:
         raise HTTPException(404,"Weather is available for Nigerian states and the FCT only")
@@ -771,7 +813,8 @@ async def weather(state: str):
             "source":"https://open-meteo.com/"})
 
 @app.get("/api/polling-units/{unit_id}/weather")
-async def polling_unit_weather(unit_id: str):
+async def polling_unit_weather(unit_id: str, request: Request):
+    _check_shared_rate_limit(request, "public_read", PUBLIC_READ_RATE_LIMIT)
     with db() as con:
         unit=con.execute("SELECT id,state,lga,ward,latitude,longitude FROM polling_units WHERE id=?",(unit_id,)).fetchone()
     if not unit:

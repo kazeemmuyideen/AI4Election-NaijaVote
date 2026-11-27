@@ -415,3 +415,25 @@ def test_sync_nihsa_does_not_leak_exception(client, monkeypatch):
     assert response.status_code == 502
     assert response.json()["detail"] == "NIHSA feed could not be normalized"
     assert "secret-upstream-detail" not in response.text
+
+
+def test_public_read_endpoints_are_rate_limited(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setattr(app_module, "PUBLIC_READ_RATE_LIMIT", 2)
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint='public_read'")
+    assert client.get("/api/polling-units", params={"state": "Lagos"}).status_code == 200
+    assert client.get("/api/polling-unit-areas", params={"state": "Lagos"}).status_code == 200
+    assert client.get("/api/risk", params={"state": "Lagos"}).status_code == 429
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint='public_read'")
+
+
+def test_security_headers_on_error_response(client):
+    huge = "x" * (2 * 1024 * 1024)
+    response = client.post("/api/ask", json={"question": huge, "language": "en"})
+    assert response.status_code == 413
+    assert response.headers.get("x-content-type-options") == "nosniff"
+    assert response.headers.get("x-frame-options") == "DENY"
+    assert "content-security-policy" in response.headers
