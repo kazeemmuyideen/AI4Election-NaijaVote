@@ -154,11 +154,11 @@ class Client:
             self.requests += 1
             if status in (200, 302):
                 safe_headers = {
-            key: value
-            for key, value in response_headers.items()
-            if key.lower() not in {"set-cookie", "cookie"}
-        }
-        payload = {
+                    key: value
+                    for key, value in response_headers.items()
+                    if key.lower() not in {"set-cookie", "cookie"}
+                }
+                payload = {
                     "status": status,
                     "headers": safe_headers,
                     "body": text,
@@ -167,7 +167,7 @@ class Client:
                 with tmp.open("w", encoding="utf-8") as fh:
                     json.dump(payload, fh)
                 os.replace(tmp, path)
-                return status, response_headers, text
+                return status, safe_headers, text
             if status == 403:
                 # Respect an explicit access-control refusal: do not hammer it.
                 raise RuntimeError(f"HTTP 403 for {url}")

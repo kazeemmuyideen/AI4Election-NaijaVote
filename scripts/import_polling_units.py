@@ -83,7 +83,6 @@ def main() -> int:
         # single transaction so nationwide CSVs use constant importer memory.
         staged.seek(0)
         with db() as con:
-            con.execute("BEGIN IMMEDIATE")
             batch_rows = []
             for line in staged:
                 batch_rows.append(tuple(json.loads(line)))

@@ -350,10 +350,62 @@ def test_config_and_health_agree_on_weather(client, monkeypatch):
     assert health["integrations"]["nimet"] is False
 
 
+def test_admin_auth_requires_bearer_scheme(client):
+    response = client.post("/api/admin/polling-units", headers={"Authorization": "Basic dGVzdDphZG1pbg=="}, json=_unit())
+    assert response.status_code == 401
+
+
+def test_admin_endpoints_are_rate_limited(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setattr(app_module, "ADMIN_RATE_LIMIT", 2)
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint IN ('admin','admin_auth_fail')")
+    payload = _unit(code="RL/ADMIN/001")
+    assert client.post("/api/admin/polling-units", headers=ADMIN, json=payload).status_code == 200
+    payload["code"] = "RL/ADMIN/002"
+    assert client.post("/api/admin/polling-units", headers=ADMIN, json=payload).status_code == 200
+    payload["code"] = "RL/ADMIN/003"
+    assert client.post("/api/admin/polling-units", headers=ADMIN, json=payload).status_code == 429
+    with app_module.db() as con:
+        con.execute("DELETE FROM request_rate_limits WHERE endpoint IN ('admin','admin_auth_fail')")
+
+
+def test_large_json_body_is_rejected_before_parse(client):
+    huge = "x" * (2 * 1024 * 1024)
+    response = client.post("/api/ask", json={"question": huge, "language": "en"})
+    assert response.status_code == 413
+
+
+def test_translation_endpoint_must_be_public_https(client, monkeypatch):
+    import backend.app as app_module
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://127.0.0.1:9999/v1/chat/completions")
+
+    async def should_not_call(*args, **kwargs):
+        raise AssertionError("private translation endpoint should not be called")
+
+    monkeypatch.setattr(app_module.get_http_client(), "post", should_not_call)
+    response = client.post("/api/ask", json={"question": "What time does voting happen?", "language": "yo"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["language"] == "en"
+    assert body["requested_language"] == "yo"
+
+
+def test_nihsa_feed_rejects_private_host(client, monkeypatch):
+    monkeypatch.setenv("NIHSA_FEED_URL", "https://127.0.0.1/feed")
+    response = client.post("/api/admin/sync-nihsa", headers=ADMIN)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "NIHSA_FEED_URL must use a public HTTPS URL"
+
+
 def test_sync_nihsa_does_not_leak_exception(client, monkeypatch):
     import backend.app as app_module
 
     monkeypatch.setenv("NIHSA_FEED_URL", "https://nihsa.gov.ng/feed")
+    monkeypatch.setattr(app_module, "_hostname_resolves_public", lambda host: True)
 
     async def boom(*args, **kwargs):
         raise app_module.httpx.ReadTimeout("secret-upstream-detail", request=None)

@@ -6,13 +6,15 @@ import csv
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import math
 import os
 import re
 import sqlite3
-import threading
+import socket
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -48,9 +50,20 @@ DECLINE_ANSWER = (
 # answers are actually re-reviewed.
 FAQ_VERIFIED_AT = "2026-11-09"
 
-ASK_RATE_LIMIT = int(os.getenv("ASK_RATE_LIMIT_PER_MINUTE", "60"))
-WEBHOOK_RATE_LIMIT = int(os.getenv("WEBHOOK_RATE_LIMIT_PER_MINUTE", "120"))
-WEBHOOK_MAX_BODY_BYTES = int(os.getenv("WEBHOOK_MAX_BODY_BYTES", "65536"))
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else 0
+
+
+ASK_RATE_LIMIT = _positive_int_env("ASK_RATE_LIMIT_PER_MINUTE", 60)
+ADMIN_RATE_LIMIT = _positive_int_env("ADMIN_RATE_LIMIT_PER_MINUTE", 30)
+WEBHOOK_RATE_LIMIT = _positive_int_env("WEBHOOK_RATE_LIMIT_PER_MINUTE", 120)
+WEBHOOK_MAX_BODY_BYTES = _positive_int_env("WEBHOOK_MAX_BODY_BYTES", 65536)
+MAX_REQUEST_BODY_BYTES = _positive_int_env("MAX_REQUEST_BODY_BYTES", 1_048_576)
+MAX_ADMIN_IMPORT_BYTES = _positive_int_env("MAX_ADMIN_IMPORT_BYTES", 20_000_000)
 
 # Knowledge rows and HTTP connections are process-wide resources: reloading and
 # re-parsing every answer for each question, or renegotiating TLS for each
@@ -95,6 +108,51 @@ def _iso_datetime(value: str) -> str:
     return parsed.isoformat()
 
 
+_PRIVATE_NETS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def _is_private_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return (
+        any(ip in net for net in _PRIVATE_NETS)
+        or ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _hostname_resolves_public(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        # If DNS cannot be resolved in this environment, do not treat as private.
+        # Literal private IPs and resolvable private hosts are still blocked.
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        address = info[4][0]
+        if _is_private_ip(address):
+            return False
+    return True
+
+
 def _https_url(value: str) -> str:
     try:
         parsed = urlparse(value)
@@ -106,9 +164,34 @@ def _https_url(value: str) -> str:
     return value
 
 
+def _public_https_url(value: str) -> str:
+    value = _https_url(value)
+    hostname = urlparse(value).hostname or ""
+    if _is_private_ip(hostname) or not _hostname_resolves_public(hostname):
+        raise ValueError("must be an absolute public HTTPS URL")
+    return value
+
+
 def _like(value: str) -> str:
     """Escape LIKE wildcards so user input cannot match every row."""
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _client_address(request: Request) -> str:
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+async def _read_limited_body(request: Request, limit: int) -> bytes:
+    if limit <= 0:
+        raise HTTPException(413, "Request body is too large")
+    body = bytearray()
+    async for part in request.stream():
+        body.extend(part)
+        if len(body) > limit:
+            raise HTTPException(413, "Request body is too large")
+    return bytes(body)
 
 
 def _check_rate_limit(request: Request) -> None:
@@ -118,11 +201,9 @@ def _check_rate_limit(request: Request) -> None:
 def _check_shared_rate_limit(request: Request, endpoint: str, limit: int) -> None:
     if limit <= 0:
         return
-    address = request.client.host if request.client else "unknown"
-    client_key = hashlib.sha256(address.encode()).hexdigest()
+    client_key = hashlib.sha256(_client_address(request).encode()).hexdigest()
     now = time.time()
     with db() as con:
-        con.execute("BEGIN IMMEDIATE")
         con.execute("DELETE FROM request_rate_limits WHERE requested_at <= ?", (now - 60,))
         count = con.execute(
             "SELECT count(*) FROM request_rate_limits WHERE endpoint=? AND client_key=? AND requested_at>?",
@@ -252,11 +333,64 @@ app = FastAPI(title="NaijaVote Navigators API", version="1.1.0", description="No
               docs_url="/docs" if DOCS_ENABLED else None, redoc_url="/redoc" if DOCS_ENABLED else None,
               openapi_url="/openapi.json" if DOCS_ENABLED else None)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST"], allow_headers=["Authorization","Content-Type","X-Twilio-Signature"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_origin_regex=None,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Twilio-Signature"],
+)
 
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; "
        "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
        "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+
+
+@app.middleware("http")
+async def request_limits(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH"}:
+        limit = MAX_ADMIN_IMPORT_BYTES if request.url.path == "/api/admin/import-polling-units" else MAX_REQUEST_BODY_BYTES
+        if limit <= 0:
+            return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > limit:
+                    return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+            except ValueError:
+                pass
+
+        body = bytearray()
+        more_body = True
+        original_receive = request.receive
+        while more_body:
+            message = await original_receive()
+            if message.get("type") != "http.request":
+                replay_messages = [message]
+                extra_receive = original_receive
+                break
+            chunk = message.get("body", b"")
+            body.extend(chunk)
+            if len(body) > limit:
+                return JSONResponse(status_code=413, content={"detail": "Request body is too large"})
+            more_body = message.get("more_body", False)
+        else:
+            replay_messages = [{"type": "http.request", "body": bytes(body), "more_body": False}]
+            extra_receive = original_receive
+
+        state = {"index": 0}
+
+        async def replay_receive():
+            if state["index"] < len(replay_messages):
+                msg = replay_messages[state["index"]]
+                state["index"] += 1
+                return msg
+            return await extra_receive()
+
+        request._receive = replay_receive
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -265,11 +399,13 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=(self)")
-    if request.url.scheme == "https":
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").casefold()
+    if request.url.scheme == "https" or forwarded_proto == "https":
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-    else:
-        if "Strict-Transport-Security" in response.headers:
-            del response.headers["Strict-Transport-Security"]
+    elif "Strict-Transport-Security" in response.headers:
+        del response.headers["Strict-Transport-Security"]
     if not request.url.path.startswith(("/docs", "/redoc", "/openapi.json")):
         response.headers.setdefault("Content-Security-Policy", CSP)
     return response
@@ -288,9 +424,9 @@ class UnitUpload(BaseModel):
     code: str = Field(min_length=1, max_length=100)
     latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
     longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
-    accessibility: str = "unknown"
+    accessibility: str = Field(default="unknown", max_length=100)
     source: str = Field(min_length=1, max_length=200)
-    source_url: str
+    source_url: str = Field(max_length=2048)
     verified_at: str
 
     @model_validator(mode="after")
@@ -312,15 +448,15 @@ class UnitUpload(BaseModel):
 class HazardUpload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     state: str = Field(min_length=1, max_length=100)
-    lga: str | None = None
-    ward: str | None = None
+    lga: str | None = Field(default=None, max_length=100)
+    ward: str | None = Field(default=None, max_length=100)
     latitude: float | None = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
     longitude: float | None = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
     hazard: str = Field(min_length=1, max_length=100)
     severity: int = Field(ge=0, le=100)
     details: str = Field(min_length=1, max_length=5000)
     source: str = Field(min_length=1, max_length=200)
-    source_url: str
+    source_url: str = Field(max_length=2048)
     observed_at: str
     expires_at: str
 
@@ -352,13 +488,13 @@ class HazardUpload(BaseModel):
 
 class KnowledgeUpload(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
-    id: str = Field(min_length=2,max_length=100)
+    id: str = Field(min_length=2,max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
     question: str = Field(min_length=5,max_length=1000)
     answer: str = Field(min_length=5,max_length=5000)
     language: str = Field(pattern="^(en|pcm|ha|ig|yo)$")
     keywords: list[str] = Field(min_length=1,max_length=30)
     source: str = Field(min_length=2,max_length=200)
-    source_url: str
+    source_url: str = Field(max_length=2048)
     verified_at: str
 
     @field_validator("keywords")
@@ -411,10 +547,27 @@ def _grounded_answer(query: str, language: str = "en") -> dict[str, Any]:
 @app.get("/api/health")
 def health():
     with db() as con:
-        counts={t:con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("polling_units","hazard_reports","knowledge")}
-        freshness={"polling_units_verified_at":con.execute("SELECT max(verified_at) FROM polling_units").fetchone()[0],"hazards_observed_at":con.execute("SELECT max(observed_at) FROM hazard_reports").fetchone()[0],"knowledge_verified_at":con.execute("SELECT max(verified_at) FROM knowledge").fetchone()[0]}
-    admin_configured=bool(os.getenv("ADMIN_API_TOKEN") and os.getenv("ADMIN_API_TOKEN")!="replace-with-a-long-random-secret")
-    return {"status":"ok","ready":admin_configured,"data":counts,"freshness":freshness,"integrations":{"inec_directory":counts['polling_units']>0,"open_meteo":True,"nimet":bool(os.getenv('NIMET_API_KEY') and os.getenv('NIMET_ENDPOINT')),"nihsa_feed":bool(os.getenv('NIHSA_FEED_URL')),"llm":bool(os.getenv('LLM_API_KEY')),"whatsapp":bool(os.getenv('TWILIO_AUTH_TOKEN'))}}
+        counts = {t: con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("polling_units", "hazard_reports", "knowledge")}
+        freshness = {
+            "polling_units_verified_at": con.execute("SELECT max(verified_at) FROM polling_units").fetchone()[0],
+            "hazards_observed_at": con.execute("SELECT max(observed_at) FROM hazard_reports").fetchone()[0],
+            "knowledge_verified_at": con.execute("SELECT max(verified_at) FROM knowledge").fetchone()[0],
+        }
+    admin_configured = bool(os.getenv("ADMIN_API_TOKEN") and os.getenv("ADMIN_API_TOKEN") != "replace-with-a-long-random-secret")
+    return {
+        "status": "ok",
+        "ready": admin_configured,
+        "data": counts,
+        "freshness": freshness,
+        "integrations": {
+            "inec_directory": counts["polling_units"] > 0,
+            "open_meteo": True,
+            "nimet": bool(os.getenv("NIMET_API_KEY") and os.getenv("NIMET_ENDPOINT")),
+            "nihsa_feed": bool(os.getenv("NIHSA_FEED_URL")),
+            "llm": bool(os.getenv("LLM_API_KEY")),
+            "whatsapp": bool(os.getenv("TWILIO_AUTH_TOKEN")),
+        },
+    }
 
 @app.get("/api/config")
 def config():
@@ -425,29 +578,46 @@ async def ask(payload: AskRequest, request: Request):
     _check_rate_limit(request)
     result = await run_in_threadpool(_grounded_answer, payload.question, payload.language)
     if payload.language != "en" and result.get("language") != payload.language:
-        key=os.getenv("LLM_API_KEY"); endpoint=os.getenv("LLM_BASE_URL","https://api.openai.com/v1/chat/completions"); model=os.getenv("LLM_MODEL","gpt-4o-mini")
+        key = os.getenv("LLM_API_KEY")
+        endpoint = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1/chat/completions")
+        model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         if key:
-            language_names={"pcm":"Nigerian Pidgin","ha":"Hausa","ig":"Igbo","yo":"Yorùbá"}
-            prompt=("Translate the answer below into "+language_names[payload.language]+". Preserve its meaning exactly. Do not add, omit, or infer civic instructions. Return only the translation.\n\n"+result['answer'])
+            language_names = {"pcm": "Nigerian Pidgin", "ha": "Hausa", "ig": "Igbo", "yo": "Yorùbá"}
+            prompt = (
+                "Translate the answer below into "
+                + language_names[payload.language]
+                + ". Preserve its meaning exactly. Do not add, omit, or infer civic instructions. Return only the translation.\n\n"
+                + result["answer"]
+            )
             try:
-                if not endpoint.startswith("https://"): raise ValueError("Translation endpoint must use HTTPS")
-                response=await get_http_client().post(endpoint,headers={"Authorization":f"Bearer {key}"},json={"model":model,"temperature":0,"messages":[{"role":"user","content":prompt}]})
+                endpoint = _public_https_url(endpoint)
+                response = await get_http_client().post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={"model": model, "temperature": 0, "messages": [{"role": "user", "content": prompt}]},
+                    timeout=15,
+                )
                 response.raise_for_status()
-                translated=response.json()["choices"][0]["message"]["content"].strip()
-                if translated: result['answer']=translated; result['language']=payload.language
-                else: raise ValueError("empty translation")
-            except (httpx.HTTPError,ValueError,KeyError,IndexError,TypeError,AttributeError):
-                result['requested_language']=payload.language
-                result['notice']='A translated answer is temporarily unavailable. English source text is shown to avoid inventing civic guidance.'
+                translated = response.json()["choices"][0]["message"]["content"].strip()
+                if not translated:
+                    raise ValueError("empty translation")
+                result["answer"] = translated
+                result["language"] = payload.language
+            except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+                result["requested_language"] = payload.language
+                result["notice"] = "A translated answer is temporarily unavailable. English source text is shown to avoid inventing civic guidance."
         else:
-            result['requested_language']=payload.language
-            result['notice']='Verified language translation is not configured. English source text is shown to avoid inventing civic guidance.'
+            result["requested_language"] = payload.language
+            result["notice"] = "Verified language translation is not configured. English source text is shown to avoid inventing civic guidance."
     return result
 
 @app.get("/api/polling-units")
 def polling_units(
-    state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100), ward: str = Query(default="", max_length=100),
-    q: str = Query(default="", max_length=300), limit: int = Query(default=20, ge=1, le=500),
+    state: str = Query(min_length=1, max_length=100),
+    lga: str = Query(default="", max_length=100),
+    ward: str = Query(default="", max_length=100),
+    q: str = Query(default="", max_length=300),
+    limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
 ):
     state=state.strip()
@@ -487,7 +657,7 @@ def polling_units(
     return {"results":[dict(r) for r in rows],"count":len(rows),"total_count":total,"limit":limit,"offset":offset,"source":"source-attributed local register","coverage":{"loaded_states":loaded_states,"loaded_state_count":len(loaded_states),"total_states_and_fct":37},"official_locator":INEC_URL,"notice":notice}
 
 @app.get("/api/polling-unit-areas")
-def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: str = ""):
+def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100)):
     state=state.strip()
     with db() as con:
         if lga:
@@ -505,7 +675,7 @@ def polling_unit_areas(state: str = Query(min_length=1, max_length=100), lga: st
     return {"state":state,"areas":[row[0] for row in rows]}
 
 @app.get("/api/risk")
-def risk(state: str = Query(min_length=1, max_length=100), lga: str = "", ward: str = ""):
+def risk(state: str = Query(min_length=1, max_length=100), lga: str = Query(default="", max_length=100), ward: str = Query(default="", max_length=100)):
     state=state.strip()
     if not state: raise HTTPException(422,"State must not be empty")
     clauses=["state LIKE ? ESCAPE '\\'"]; args=[f"%{_like(state)}%"]
@@ -634,17 +804,24 @@ async def polling_unit_weather(unit_id: str):
             "message":"Current weather is temporarily unavailable. Please try again.",
             "source":"https://open-meteo.com/"})
 
-def require_admin(authorization: str = Header(default="")) -> None:
-    token=os.getenv("ADMIN_API_TOKEN")
-    if not token or token=="replace-with-a-long-random-secret": raise HTTPException(503,"Set a unique ADMIN_API_TOKEN before using admin routes")
-    supplied=authorization[7:].strip() if authorization.startswith("Bearer ") else authorization.strip()
+def require_admin(request: Request, authorization: str = Header(default="")) -> None:
+    token = os.getenv("ADMIN_API_TOKEN")
+    if not token or token == "replace-with-a-long-random-secret":
+        raise HTTPException(503, "Set a unique ADMIN_API_TOKEN before using admin routes")
+    supplied = authorization[7:].strip() if authorization.casefold().startswith("bearer ") else ""
+    if not supplied:
+        _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        raise HTTPException(401, "Valid admin bearer token required")
     try:
-        supplied_bytes=supplied.encode("ascii")
-        token_bytes=token.encode("ascii")
+        supplied_bytes = supplied.encode("ascii")
+        token_bytes = token.encode("ascii")
     except UnicodeEncodeError:
-        raise HTTPException(401,"Valid admin bearer token required")
-    if not hmac.compare_digest(supplied_bytes,token_bytes):
-        raise HTTPException(401,"Valid admin bearer token required")
+        _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        raise HTTPException(401, "Valid admin bearer token required")
+    if not hmac.compare_digest(supplied_bytes, token_bytes):
+        _check_shared_rate_limit(request, "admin_auth_fail", ADMIN_RATE_LIMIT)
+        raise HTTPException(401, "Valid admin bearer token required")
+    _check_shared_rate_limit(request, "admin", ADMIN_RATE_LIMIT)
 
 def _unit_row(p: UnitUpload) -> tuple:
     identity=f"{p.state}|{p.lga}|{p.ward}|{p.code}"
@@ -672,39 +849,35 @@ def add_hazard(payload: HazardUpload):
 
 @app.post("/api/admin/import-polling-units", dependencies=[Depends(require_admin)])
 async def import_units(request: Request):
-    body_parts=[]
-    body_size=0
-    async for part in request.stream():
-        body_size+=len(part)
-        if body_size>20_000_000: raise HTTPException(413,"CSV exceeds 20 MB")
-        body_parts.append(part)
-    body=b"".join(body_parts)
+    _check_shared_rate_limit(request, "admin_import", ADMIN_RATE_LIMIT)
+    body = await _read_limited_body(request, MAX_ADMIN_IMPORT_BYTES)
 
     def _import() -> int:
         try:
-            reader=csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
-            needed={"state","lga","ward","name","code","source","source_url","verified_at"}
-            if not needed.issubset(set(reader.fieldnames or [])): raise ValueError(f"Required CSV columns: {', '.join(sorted(needed))}")
-            with tempfile.TemporaryFile(mode="w+t",encoding="utf-8") as staged:
-                count=0
+            reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
+            needed = {"state", "lga", "ward", "name", "code", "source", "source_url", "verified_at"}
+            if not needed.issubset(set(reader.fieldnames or [])):
+                raise ValueError(f"Required CSV columns: {', '.join(sorted(needed))}")
+            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as staged:
+                count = 0
                 for row in reader:
-                    for key in ("latitude","longitude","accessibility"):
-                        if row.get(key)=="": row[key]=None if key!="accessibility" else "unknown"
-                    staged.write(json.dumps(_unit_row(UnitUpload(**row)),ensure_ascii=False)+"\n")
-                    count+=1
+                    for key in ("latitude", "longitude", "accessibility"):
+                        if row.get(key) == "":
+                            row[key] = None if key != "accessibility" else "unknown"
+                    staged.write(json.dumps(_unit_row(UnitUpload(**row)), ensure_ascii=False) + "\n")
+                    count += 1
                 staged.seek(0)
                 with db() as con:
-                    con.execute("BEGIN IMMEDIATE")
-                    batch=[]
+                    batch = []
                     for line in staged:
                         batch.append(tuple(json.loads(line)))
-                        if len(batch)>=2000:
-                            con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",batch)
+                        if len(batch) >= 2000:
+                            con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", batch)
                             batch.clear()
                     if batch:
-                        con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",batch)
-        except (UnicodeDecodeError,ValueError,TypeError) as exc:
-            raise HTTPException(400,str(exc)) from exc
+                        con.executemany("INSERT OR REPLACE INTO polling_units VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", batch)
+        except (UnicodeDecodeError, ValueError, TypeError) as exc:
+            raise HTTPException(400, "Invalid CSV import data") from exc
         return count
 
     return {"imported": await run_in_threadpool(_import)}
@@ -718,57 +891,89 @@ def add_knowledge(payload: KnowledgeUpload):
 
 @app.post("/api/webhooks/whatsapp")
 async def whatsapp(request: Request):
-    _check_shared_rate_limit(request,"whatsapp",WEBHOOK_RATE_LIMIT)
-    form_body=bytearray()
-    async for part in request.stream():
-        form_body.extend(part)
-        if len(form_body)>WEBHOOK_MAX_BODY_BYTES: raise HTTPException(413,"Webhook body is too large")
+    _check_shared_rate_limit(request, "whatsapp", WEBHOOK_RATE_LIMIT)
+    form_body = await _read_limited_body(request, WEBHOOK_MAX_BODY_BYTES)
     from urllib.parse import parse_qs
-    form={key:values[-1] for key,values in parse_qs(form_body.decode("utf-8", "replace"),keep_blank_values=True).items()}
-    token=os.getenv("TWILIO_AUTH_TOKEN")
-    signature=request.headers.get("X-Twilio-Signature", "")
-    if not token: raise HTTPException(503,"WhatsApp webhook is not configured")
-    signed=os.getenv("TWILIO_WEBHOOK_URL",str(request.url))
-    signed+= ''.join(key+str(form.get(key,"")) for key in sorted(form.keys()))
-    expected=base64.b64encode(hmac.new(token.encode(),signed.encode(),hashlib.sha1).digest()).decode()
+
+    form = {
+        key: values[-1]
+        for key, values in parse_qs(form_body.decode("utf-8", "replace"), keep_blank_values=True).items()
+    }
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not token:
+        raise HTTPException(503, "WhatsApp webhook is not configured")
+    configured_url = os.getenv("TWILIO_WEBHOOK_URL", "").strip()
+    if configured_url:
+        try:
+            signed = _https_url(configured_url)
+        except ValueError as exc:
+            raise HTTPException(503, "WhatsApp webhook URL is not configured safely") from exc
+    else:
+        # Use the actual request URL for signature validation. Deployments should
+        # set TWILIO_WEBHOOK_URL to the exact public HTTPS callback URL.
+        signed = str(request.url)
+        parsed_signed = urlparse(signed)
+        host = (parsed_signed.hostname or "").casefold()
+        if parsed_signed.scheme != "https":
+            if parsed_signed.scheme != "http" or host not in {"localhost", "127.0.0.1", "::1", "testserver"}:
+                raise HTTPException(503, "WhatsApp webhook URL is not configured safely")
+    signed += "".join(key + str(form.get(key, "")) for key in sorted(form.keys()))
+    expected = base64.b64encode(hmac.new(token.encode(), signed.encode(), hashlib.sha1).digest()).decode()
     try:
-        signature_bytes=signature.encode("ascii")
-        expected_bytes=expected.encode("ascii")
+        signature_bytes = signature.encode("ascii")
+        expected_bytes = expected.encode("ascii")
     except UnicodeEncodeError:
-        raise HTTPException(403,"Invalid provider signature")
-    if not hmac.compare_digest(signature_bytes,expected_bytes): raise HTTPException(403,"Invalid provider signature")
-    incoming=str(form.get("Body", "")).strip()
-    if not incoming: return Response(content="<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Please send a civic question. For official information, visit inecnigeria.org.</Message></Response>",media_type="application/xml")
-    result=await run_in_threadpool(_grounded_answer, incoming, "en")
-    reply=f"{result['answer']} Source: {result['citations'][0]['url']}"
-    if len(reply)>1500: reply=reply[:1490]+"…"
-    xml=f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{reply.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')}</Message></Response>"
-    return Response(content=xml,media_type="application/xml")
+        raise HTTPException(403, "Invalid provider signature")
+    if not hmac.compare_digest(signature_bytes, expected_bytes):
+        raise HTTPException(403, "Invalid provider signature")
+    incoming = str(form.get("Body", "")).strip()
+    if not incoming:
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Message>Please send a civic question. For official information, visit inecnigeria.org.</Message></Response>',
+            media_type="application/xml",
+        )
+    result = await run_in_threadpool(_grounded_answer, incoming[:1000], "en")
+    reply = f"{result['answer']} Source: {result['citations'][0]['url']}"
+    if len(reply) > 1500:
+        reply = reply[:1490] + "…"
+    xml = f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>{reply.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')}</Message></Response>"
+    return Response(content=xml, media_type="application/xml")
 
 @app.post("/api/admin/sync-nihsa", dependencies=[Depends(require_admin)])
 async def sync_nihsa():
-    feed=os.getenv("NIHSA_FEED_URL")
-    if not feed: raise HTTPException(503,"Configure an authorized NIHSA_FEED_URL first")
-    if not feed.startswith("https://"): raise HTTPException(500,"NIHSA_FEED_URL must use HTTPS")
-    headers={}
-    if os.getenv("NIHSA_API_TOKEN"): headers["Authorization"]=f"Bearer {os.getenv('NIHSA_API_TOKEN')}"
+    feed = os.getenv("NIHSA_FEED_URL")
+    if not feed:
+        raise HTTPException(503, "Configure an authorized NIHSA_FEED_URL first")
     try:
-        response=await get_http_client().get(feed,timeout=30,headers=headers)
-        response.raise_for_status(); data=response.json()
-        if not isinstance(data,list): raise ValueError("Expected a JSON array of normalized hazard reports")
-        items=[]
-        for raw in data:
-            report=HazardUpload(**raw)
-            hostname=urlparse(report.source_url).hostname or ""
-            if not (hostname=="nihsa.gov.ng" or hostname.endswith(".nihsa.gov.ng")):
+        feed = _public_https_url(feed)
+    except ValueError as exc:
+        raise HTTPException(500, "NIHSA_FEED_URL must use a public HTTPS URL") from exc
+    headers = {}
+    if os.getenv("NIHSA_API_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.getenv('NIHSA_API_TOKEN')}"
+    try:
+        response = await get_http_client().get(feed, timeout=30, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, list):
+            raise ValueError("Expected a JSON array of normalized hazard reports")
+        items = []
+        for raw in data[:1000]:
+            report = HazardUpload(**raw)
+            hostname = urlparse(report.source_url).hostname or ""
+            if not (hostname == "nihsa.gov.ng" or hostname.endswith(".nihsa.gov.ng")):
                 raise ValueError("Each report must cite an official NIHSA source URL")
             items.append(_hazard_row(report))
+
         def _save() -> None:
-            with db() as con: con.executemany("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",items)
+            with db() as con:
+                con.executemany("INSERT OR REPLACE INTO hazard_reports VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", items)
+
         await run_in_threadpool(_save)
-        return {"imported":len(items),"source":"NIHSA authorized feed"}
-    except (httpx.HTTPError,ValueError,TypeError) as exc:
-        raise HTTPException(502,"NIHSA feed could not be normalized") from exc
+        return {"imported": len(items), "source": "NIHSA authorized feed"}
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        raise HTTPException(502, "NIHSA feed could not be normalized") from exc
 
 @app.get("/", include_in_schema=False)
 @app.get("/index.html", include_in_schema=False)

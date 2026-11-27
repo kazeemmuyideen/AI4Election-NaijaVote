@@ -6,7 +6,7 @@ An accessible, nonpartisan civic information service for Nigerian voters. The re
 
 | Path | Role |
 | --- | --- |
-| `index.html`, `styles.css`, `app.js`, `sw.js` | Low-bandwidth installable PWA: sourced Q&A chat, polling-unit lookup, weather/alerts, offline shell |
+| `index.html`, `styles.css`, `app.js`, `sw.js`, `manifest.webmanifest`, icons | Low-bandwidth installable PWA: sourced Q&A chat, polling-unit lookup, weather/alerts, offline shell |
 | `backend/app.py` | FastAPI service: health/config, Q&A, polling units, risk/weather, protected admin imports, Twilio webhook |
 | `scripts/fetch_inec_polling_units.py` | Resumable, cached crawl of INEC's public polling-unit locator into importable CSV |
 | `scripts/import_polling_units.py` | Validated bulk CSV import into SQLite (bypasses the API's 20 MB upload cap) |
@@ -49,8 +49,10 @@ For a container run, use the included `Dockerfile` and `docker-compose.yml` or p
 - NIHSA feed synchronization accepts an authorized feed normalized to the documented JSON shape below. The official NIHSA website publishes seasonal outlooks and bulletins; these are distinct from live emergency alerts. Public NIHSA information remains linked even when no authorized feed is configured.
 - Browser speech recognition and speech synthesis depend on the visitor's browser and available voice/language packs.
 - Polling-unit results are paginated in batches of 100; use “Load more” to continue through a large ward. `/api/polling-units` supports `limit` and `offset` for other clients.
+- The frontend renders API content as text nodes, allows only HTTPS source links, and the service worker caches only same-origin static shell assets. Deploy behind HTTPS with appropriate security headers and a reverse proxy/CDN policy.
 - Rate limits are stored in SQLite, with hashed client addresses, and are shared by workers that use the same database file. If running behind a reverse proxy, configure Uvicorn's trusted `FORWARDED_ALLOW_IPS` to the proxy addresses only; do not trust forwarded headers from arbitrary clients. A managed PostgreSQL/Redis limiter is recommended when scaling beyond the single-host SQLite deployment.
 - `/api/health` includes the newest local verification/observation dates and a `ready` flag that is false if the admin token is unset or still the example placeholder. These dates describe stored data; they do not independently certify its accuracy or freshness.
+- Admin routes require a Bearer token and are rate-limited. Request bodies have configurable size caps; the polling-unit CSV import uses the larger admin import cap. Upstream feed/translation URLs are restricted to public HTTPS endpoints to reduce SSRF risk.
 
 ## Polling-unit data import
 
